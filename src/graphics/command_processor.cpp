@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cinttypes>
 #include <cmath>
@@ -42,6 +43,12 @@
 #include <rex/system/kernel_state.h>
 #include <rex/system/thread_state.h>
 #include <rex/system/user_module.h>
+
+#if REX_ARCH_AMD64
+#include <immintrin.h>
+#elif REX_ARCH_ARM64
+#include <arm_neon.h>
+#endif
 
 REXCVAR_DEFINE_INT32(gpu_trace_bins_vblank, -1, "GPU",
                      "Diagnostics: log the bin masks, bin selects, screen extent writes, draws, "
@@ -84,6 +91,10 @@ REXCVAR_DEFINE_BOOL(gpu_record_coalesce_scratch, true, "GPU",
                     "recorded once with their latest value before the next batch, call, scratch "
                     "range run or scratch control write (RECORDER_PER_DRAW_BACKLOG PD-1.6)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(gpu_decode_compare_runs_wide, true, "GPU",
+                    "With gpu_record_thread, the decoder compares a register run with the "
+                    "register file four registers at a time when the run holds no register "
+                    "whose write always matters (constants and most state)");
 REXCVAR_DEFINE_BOOL(gpu_record_merge_constant_runs, true, "GPU",
                     "With gpu_record_thread, the decoder extends the last recorded float "
                     "constant run over a gap of up to 16 registers (their current values) "
@@ -685,6 +696,54 @@ bool RegisterWriteAlwaysMatters(uint32_t index) {
          (index >= XE_GPU_REG_DC_LUT_RW_INDEX && index <= XE_GPU_REG_DC_LUT_30_COLOR) ||
          (index >= XE_GPU_REG_VGT_EVENT_INITIATOR && index <= XE_GPU_REG_VGT_DRAW_INITIATOR);
 }
+
+// Whether [start, end) holds a register RegisterWriteAlwaysMatters names. Most
+// runs (float and fetch constants, most state) hold none, so their registers
+// can be compared without asking per register.
+bool RunHasRegisterWriteAlwaysMatters(uint32_t start, uint32_t end) {
+  auto overlaps = [&](uint32_t first, uint32_t last) { return start <= last && end > first; };
+  return overlaps(XE_GPU_REG_SCRATCH_REG0, XE_GPU_REG_SCRATCH_REG7) ||
+         overlaps(XE_GPU_REG_COHER_STATUS_HOST, XE_GPU_REG_COHER_STATUS_HOST) ||
+         overlaps(XE_GPU_REG_DC_LUT_RW_INDEX, XE_GPU_REG_DC_LUT_30_COLOR) ||
+         overlaps(XE_GPU_REG_VGT_EVENT_INITIATOR, XE_GPU_REG_VGT_DRAW_INITIATOR);
+}
+
+// The first index in [i, count) whose guest (big-endian) value differs from
+// the shadow register (kChanged) or equals it (!kChanged), or count. Four
+// registers a step: the decoder compares about a million dwords a frame.
+template <bool kChanged>
+uint32_t FindRegisterChange(const uint32_t* shadow, const uint32_t* guest, uint32_t i,
+                            uint32_t count) {
+#if REX_ARCH_AMD64
+  const __m128i swap = _mm_set_epi8(0x0C, 0x0D, 0x0E, 0x0F, 0x08, 0x09, 0x0A, 0x0B, 0x04, 0x05,
+                                    0x06, 0x07, 0x00, 0x01, 0x02, 0x03);
+  for (; i + 4 <= count; i += 4) {
+    const __m128i value =
+        _mm_shuffle_epi8(_mm_loadu_si128(reinterpret_cast<const __m128i*>(guest + i)), swap);
+    const __m128i current = _mm_loadu_si128(reinterpret_cast<const __m128i*>(shadow + i));
+    const int equal = _mm_movemask_ps(_mm_castsi128_ps(_mm_cmpeq_epi32(value, current)));
+    const int hit = kChanged ? (~equal & 0xF) : equal;
+    if (hit) {
+      return i + uint32_t(std::countr_zero(uint32_t(hit)));
+    }
+  }
+#elif REX_ARCH_ARM64
+  for (; i + 4 <= count; i += 4) {
+    const uint32x4_t value =
+        vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(reinterpret_cast<const uint8_t*>(guest + i))));
+    const uint32x4_t equal = vceqq_u32(value, vld1q_u32(shadow + i));
+    if (vmaxvq_u32(kChanged ? vmvnq_u32(equal) : equal)) {
+      break;  // the scalar loop finds the lane
+    }
+  }
+#endif
+  for (; i < count; ++i) {
+    if ((shadow[i] != rex::byte_swap(guest[i])) == kChanged) {
+      return i;
+    }
+  }
+  return count;
+}
 }  // namespace
 
 void CommandProcessor::FlushPendingScratchWrites() {
@@ -693,7 +752,7 @@ void CommandProcessor::FlushPendingScratchWrites() {
     return;
   }
   decode_pending_scratch_ = 0;
-  std::vector<uint32_t>& words = record_batch_->words;
+  RecordWords& words = record_batch_->words;
   uint32_t scratch;
   while (rex::bit_scan_forward(pending, &scratch)) {
     pending &= ~(UINT32_C(1) << scratch);
@@ -744,7 +803,7 @@ void CommandProcessor::PacketWriteRegister(uint32_t index, uint32_t value) {
   } else {
     decode_extended_register_values_.insert_or_assign(index, value);
   }
-  std::vector<uint32_t>& words = record_batch_->words;
+  RecordWords& words = record_batch_->words;
   words.push_back(kRecordOne);
   words.push_back(index);
   words.push_back(value);
@@ -777,6 +836,20 @@ void CommandProcessor::PacketWriteRegistersFromMem(uint32_t start_index, const u
     uint32_t i = 0;
     decode_source_runs_.store(decode_source_runs_.load(std::memory_order_relaxed) + 1,
                               std::memory_order_relaxed);
+    if (REXCVAR_GET(gpu_decode_compare_runs_wide) &&
+        !RunHasRegisterWriteAlwaysMatters(start_index, start_index + num_registers)) {
+      // The same sub-runs as below, found four registers at a time.
+      i = FindRegisterChange<true>(shadow, base, 0, num_registers);
+      while (i < num_registers) {
+        const uint32_t end = FindRegisterChange<false>(shadow, base, i + 1, num_registers);
+        memory::copy_and_swap(shadow + i, base + i, end - i);
+        decode_sub_runs_.store(decode_sub_runs_.load(std::memory_order_relaxed) + 1,
+                               std::memory_order_relaxed);
+        RecordRegisterRun(start_index + i, base + i, end - i);
+        i = FindRegisterChange<true>(shadow, base, end, num_registers);
+      }
+      return;
+    }
     while (i < num_registers) {
       if (shadow[i] == rex::byte_swap(base[i]) && !RegisterWriteAlwaysMatters(start_index + i)) {
         ++i;
@@ -810,7 +883,7 @@ void CommandProcessor::PacketWriteRegistersFromMem(uint32_t start_index, const u
 
 void CommandProcessor::RecordRegisterRun(uint32_t start_index, const uint32_t* base,
                                          uint32_t num_registers) {
-  std::vector<uint32_t>& words = record_batch_->words;
+  RecordWords& words = record_batch_->words;
   // Float constants arrive in many small runs (about 12 a draw of 3 to 4
   // registers), and each run costs the recorder a dispatch and its checks:
   // one following the last recorded run within a short gap extends it, the
@@ -2617,7 +2690,7 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
       // A plain record rather than a closure: the draw's state is too large
       // for std::function's inline storage, and a heap allocation per draw
       // freed on the other thread costs more than the copy.
-      std::vector<uint32_t>& words = record_batch_->words;
+      RecordWords& words = record_batch_->words;
       const size_t offset = words.size();
       words.resize(offset + 1 + kDrawRecordWords);
       words[offset] = kRecordDraw;
@@ -2918,7 +2991,7 @@ bool CommandProcessor::ExecutePacketType3_IM_LOAD(memory::RingBuffer* reader, ui
     last.hash = ucode_hash;
     last.dword_count = size_dwords;
     FlushPendingScratchWrites();
-    std::vector<uint32_t>& words = record_batch_->words;
+    RecordWords& words = record_batch_->words;
     const size_t offset = words.size();
     words.resize(offset + 1 + kLoadShaderRecordWords);
     uint32_t* entry = words.data() + offset;

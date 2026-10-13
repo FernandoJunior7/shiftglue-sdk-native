@@ -538,10 +538,30 @@ class CommandProcessor {
 #endif  // REX_HAS_VULKAN
 
  private:
+  // Leaves new elements uninitialized on resize: a register run is resized
+  // into the batch and then overwritten whole, so zeroing it first is wasted
+  // work on the decoder thread.
+  template <typename T>
+  struct DefaultInitAllocator : std::allocator<T> {
+    template <typename U>
+    struct rebind {
+      using other = DefaultInitAllocator<U>;
+    };
+    using std::allocator<T>::allocator;
+    template <typename U>
+    void construct(U* p) noexcept {
+      ::new (static_cast<void*>(p)) U;
+    }
+    template <typename U, typename... Args>
+    void construct(U* p, Args&&... args) {
+      ::new (static_cast<void*>(p)) U(std::forward<Args>(args)...);
+    }
+  };
+  using RecordWords = std::vector<uint32_t, DefaultInitAllocator<uint32_t>>;
   struct RecordBatch {
     // Records: kRecordRun start count dwords (host order)..., kRecordOne index value,
     // kRecordCall function-index.
-    std::vector<uint32_t> words;
+    RecordWords words;
     std::vector<std::function<void()>> fns;
   };
   static constexpr uint32_t kRecordRun = 0;
