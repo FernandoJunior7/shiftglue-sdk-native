@@ -437,8 +437,20 @@ class SpirvShaderTranslator : public ShaderTranslator {
     // switch over the storage buffer bindings
     // (vulkan_shared_memory_texel_buffer).
     bool shared_memory_texel_buffer;
+    // NL-3.3: float constants read by register number through a page table
+    // in push constants (16 registers a page, vertex pages 0-15, pixel pages
+    // 16-31) from a heap of pages bound at the float constant bindings,
+    // instead of a buffer of the shader's used constants packed tightly
+    // (vulkan_paged_float_constants).
+    bool paged_float_constants;
   };
   static constexpr uint32_t kSharedMemoryTexelBufferBinding = 2;
+  // NL-3.3: paged float constants.
+  static constexpr uint32_t kFloatConstantPageRegisters = 16;
+  static constexpr uint32_t kFloatConstantPageBytes = kFloatConstantPageRegisters * 16;
+  static constexpr uint32_t kFloatConstantPageCount = 32;
+  // Two 16-bit page indices a dword.
+  static constexpr uint32_t kFloatConstantPageTableBytes = kFloatConstantPageCount * 2;
 
   SpirvShaderTranslator(const Features& features, bool native_2x_msaa_with_attachments,
                         bool native_2x_msaa_no_attachments, bool edram_fragment_shader_interlock,
@@ -928,6 +940,8 @@ class SpirvShaderTranslator : public ShaderTranslator {
   };
   spv::Id uniform_system_constants_;
   spv::Id uniform_float_constants_;
+  // NL-3.3: the page table of paged float constants (push constants).
+  spv::Id push_float_constant_pages_;
   spv::Id uniform_bool_loop_constants_;
   spv::Id uniform_fetch_constants_;
   // PD-4: the bindless arrays (2D array, 3D, cube images; samplers), created

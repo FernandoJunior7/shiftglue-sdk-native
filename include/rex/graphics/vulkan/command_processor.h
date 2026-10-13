@@ -711,6 +711,8 @@ class VulkanCommandProcessor : public CommandProcessor {
     uint64_t draws = 0;
     uint64_t uploads[5] = {}, bytes[5] = {}, repeats[5] = {};
     std::vector<uint8_t> last[5];
+    // NL-3.3: rewritten pages found unchanged and reused.
+    uint64_t float_pages_reused = 0;
   } constant_census_;
   bool constant_census_enabled_ = false;
   // PD-4: the bindless indices last written after the fetch constants
@@ -891,6 +893,38 @@ class VulkanCommandProcessor : public CommandProcessor {
 
   std::unique_ptr<ui::vulkan::VulkanUploadBufferPool> uniform_buffer_pool_;
 
+  // NL-3.3 paged float constants (vulkan_paged_float_constants): shaders read
+  // float constants through a page table in push constants from a heap of
+  // 16-register pages; a draw copies only the pages written since they were
+  // last copied. Slots 0-15 are vertex constants, 16-31 pixel constants.
+  bool paged_float_constants_ = false;
+  std::unique_ptr<ui::vulkan::VulkanUploadBufferPool> float_page_pool_;
+  size_t float_page_heap_size_ = 0;
+  // The pool page the table indexes; another invalidates every page.
+  VkBuffer float_page_heap_buffer_ = VK_NULL_HANDLE;
+  uint32_t float_pages_valid_ = 0;
+  // Pages in the current heap, and their contents, to reuse a page whose
+  // registers were rewritten with the same values.
+  uint32_t float_pages_in_heap_ = 0;
+  uint32_t float_page_shadow_[SpirvShaderTranslator::kFloatConstantPageCount]
+                             [SpirvShaderTranslator::kFloatConstantPageRegisters * 4] = {};
+  uint16_t float_page_table_[SpirvShaderTranslator::kFloatConstantPageCount] = {};
+  bool float_page_table_dirty_ = true;
+  // The command buffer's push constants were disturbed or never set.
+  bool float_page_table_push_needed_ = true;
+  void InvalidateFloatConstantPages() {
+    float_page_heap_buffer_ = VK_NULL_HANDLE;
+    float_pages_valid_ = 0;
+    float_pages_in_heap_ = 0;
+    float_page_table_push_needed_ = true;
+  }
+  // Clears the valid bits of the pages of float constants first..last (0-511).
+  void FloatConstantsWritten(uint32_t first, uint32_t last) {
+    uint32_t first_page = first >> 4, last_page = std::min(last, 511u) >> 4;
+    float_pages_valid_ &= ~(uint32_t((uint64_t(1) << (last_page + 1)) - 1) &
+                            ~((uint32_t(1) << first_page) - 1));
+  }
+
   // Descriptor set layouts used by different shaders.
   VkDescriptorSetLayout descriptor_set_layout_empty_ = VK_NULL_HANDLE;
   VkDescriptorSetLayout descriptor_set_layout_constants_ = VK_NULL_HANDLE;
@@ -910,7 +944,8 @@ class VulkanCommandProcessor : public CommandProcessor {
   // Direct3D 12 PIX warnings.
   static constexpr uint32_t kLinkedTypeDescriptorPoolSetCount = 32768;
   static const VkDescriptorPoolSize kDescriptorPoolSizeUniformBuffer;
-  static const VkDescriptorPoolSize kDescriptorPoolSizeUniformBufferDynamic;
+  // Uniform, and storage for paged float constants.
+  static const VkDescriptorPoolSize kDescriptorPoolSizeUniformBufferDynamic[2];
   static const VkDescriptorPoolSize kDescriptorPoolSizeStorageBuffer;
   static const VkDescriptorPoolSize kDescriptorPoolSizeStorageImage;
   static const VkDescriptorPoolSize kDescriptorPoolSizeTextures[2];

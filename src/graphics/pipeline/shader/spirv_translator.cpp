@@ -32,6 +32,11 @@
 // On Android: Adreno has no pushed pixel textures (see the command processor),
 // so each change allocated and wrote a set; on the Odin 2 Portal bindless takes
 // the recorder's CPU from 9.25 and 9.05 to 7.67 and 7.81 ms a frame (two pairs).
+REXCVAR_DEFINE_BOOL(vulkan_paged_float_constants, false, "GPU/Vulkan",
+                    "Read float constants by register number through a page table in push "
+                    "constants from a heap of 16-register pages, so a draw uploads only the "
+                    "pages written since they were last uploaded (NEXT_LEVEL_RESEARCH NL-3.3)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(vulkan_bindless_textures, REX_PLATFORM_ANDROID, "GPU/Vulkan",
                     "Bind textures and samplers from one long-lived descriptor set indexed by "
                     "per-draw indices instead of per-draw descriptor sets and pushes, on devices "
@@ -149,7 +154,8 @@ SpirvShaderTranslator::Features::Features(bool all)
       bindless_textures(false),
       implicit_lod_2d(false),
       implicit_lod_2d_uniform(false),
-      shared_memory_texel_buffer(false) {}
+      shared_memory_texel_buffer(false),
+      paged_float_constants(false) {}
 
 SpirvShaderTranslator::Features::Features(const ui::vulkan::VulkanDevice* const vulkan_device)
     : max_storage_buffer_range(vulkan_device->properties().maxStorageBufferRange),
@@ -204,6 +210,10 @@ SpirvShaderTranslator::Features::Features(const ui::vulkan::VulkanDevice* const 
                       device_properties.maxDescriptorSetUpdateAfterBindSamplers >= 256;
   // R32_UINT uniform texel buffers are required by Vulkan, only the element
   // count limit varies.
+  // The heap is a storage buffer, the page table 64 bytes of push constants
+  // (every device has at least 128).
+  paged_float_constants =
+      REXCVAR_GET(vulkan_paged_float_constants) && spirv_version >= spv::Spv_1_3;
   shared_memory_texel_buffer =
       REXCVAR_GET(vulkan_shared_memory_texel_buffer) &&
       GetSharedMemoryStorageBufferCountLog2(max_storage_buffer_range) != 0 &&
@@ -250,6 +260,7 @@ void SpirvShaderTranslator::Reset() {
   builder_.reset();
 
   uniform_float_constants_ = spv::NoResult;
+  push_float_constant_pages_ = spv::NoResult;
 
   input_vertex_index_ = spv::NoResult;
   input_primitive_id_ = spv::NoResult;
@@ -486,7 +497,44 @@ void SpirvShaderTranslator::StartTranslation() {
   if (!is_depth_only_fragment_shader_) {
     // Common uniform buffer - float constants.
     uint32_t float_constant_count = current_shader().constant_register_map().float_count;
-    if (float_constant_count) {
+    if (float_constant_count && features_.paged_float_constants) {
+      // NL-3.3: the heap of pages, read-only.
+      id_vector_temp_.clear();
+      id_vector_temp_.push_back(builder_->makeRuntimeArray(type_float4_));
+      builder_->addDecoration(id_vector_temp_.back(), spv::DecorationArrayStride,
+                              sizeof(float) * 4);
+      spv::Id type_heap = builder_->makeStructType(id_vector_temp_, "XeFloatConstantPages");
+      builder_->addMemberName(type_heap, 0, "float_constant_pages");
+      builder_->addMemberDecoration(type_heap, 0, spv::DecorationNonWritable);
+      builder_->addMemberDecoration(type_heap, 0, spv::DecorationOffset, 0);
+      builder_->addDecoration(type_heap, spv::DecorationBlock);
+      uniform_float_constants_ = builder_->createVariable(
+          spv::NoPrecision, spv::StorageClassStorageBuffer, type_heap, "xe_float_constant_pages");
+      builder_->addDecoration(uniform_float_constants_, spv::DecorationDescriptorSet,
+                              int(kDescriptorSetConstants));
+      builder_->addDecoration(
+          uniform_float_constants_, spv::DecorationBinding,
+          int(is_pixel_shader() ? kConstantBufferFloatPixel : kConstantBufferFloatVertex));
+      // The page table: 32 16-bit page indices in 4 uint4.
+      id_vector_temp_.clear();
+      id_vector_temp_.push_back(builder_->makeArrayType(
+          type_uint4_,
+          builder_->makeUintConstant(kFloatConstantPageTableBytes / (sizeof(uint32_t) * 4)),
+          sizeof(uint32_t) * 4));
+      builder_->addDecoration(id_vector_temp_.back(), spv::DecorationArrayStride,
+                              sizeof(uint32_t) * 4);
+      spv::Id type_pages = builder_->makeStructType(id_vector_temp_, "XeFloatConstantPageTable");
+      builder_->addMemberName(type_pages, 0, "pages");
+      builder_->addMemberDecoration(type_pages, 0, spv::DecorationOffset, 0);
+      builder_->addDecoration(type_pages, spv::DecorationBlock);
+      push_float_constant_pages_ = builder_->createVariable(
+          spv::NoPrecision, spv::StorageClassPushConstant, type_pages,
+          "xe_float_constant_page_table");
+      if (features_.spirv_version >= spv::Spv_1_4) {
+        main_interface_.push_back(uniform_float_constants_);
+        main_interface_.push_back(push_float_constant_pages_);
+      }
+    } else if (float_constant_count) {
       id_vector_temp_.clear();
       id_vector_temp_.push_back(builder_->makeArrayType(
           type_float4_, builder_->makeUintConstant(float_constant_count), sizeof(float) * 4));
@@ -3710,7 +3758,7 @@ spv::Id SpirvShaderTranslator::GetStorageAddressingIndex(
   switch (addressing_mode) {
     case InstructionStorageAddressingMode::kAbsolute: {
       uint32_t static_storage_index = storage_index;
-      if (is_float_constant) {
+      if (is_float_constant && !features_.paged_float_constants) {
         static_storage_index = constant_register_map.GetPackedFloatConstantIndex(storage_index);
         assert_true(static_storage_index != UINT32_MAX);
         if (static_storage_index == UINT32_MAX) {
@@ -3730,7 +3778,8 @@ spv::Id SpirvShaderTranslator::GetStorageAddressingIndex(
                                                  id_vector_temp_util_);
       break;
   }
-  assert_true(!is_float_constant || constant_register_map.float_dynamic_addressing);
+  assert_true(!is_float_constant || constant_register_map.float_dynamic_addressing ||
+              features_.paged_float_constants);
   assert_true(base_pointer != spv::NoResult);
   spv::Id index = builder_->createLoad(base_pointer, spv::NoPrecision);
   if (storage_index) {
@@ -3757,6 +3806,56 @@ spv::Id SpirvShaderTranslator::LoadOperandStorage(const InstructionOperand& oper
       break;
     case InstructionStorageSource::kConstantFloat:
       assert_true(uniform_float_constants_ != spv::NoResult);
+      if (features_.paged_float_constants) {
+        // NL-3.3: page = table[slot], slot = stage base + register / 16;
+        // two 16-bit indices a dword, four dwords a uint4.
+        // Relative addressing out of the stage's 256 registers wraps, as it
+        // must not read another stage's pages or past the table.
+        spv::Id register_index = builder_->createBinOp(
+            spv::OpBitwiseAnd, type_uint_,
+            builder_->createUnaryOp(spv::OpBitcast, type_uint_, index),
+            builder_->makeUintConstant(255));
+        spv::Id slot = builder_->createBinOp(
+            spv::OpShiftRightLogical, type_uint_, register_index,
+            builder_->makeUintConstant(4));
+        if (is_pixel_shader()) {
+          slot = builder_->createBinOp(spv::OpIAdd, type_uint_, slot,
+                                       builder_->makeUintConstant(kFloatConstantPageCount / 2));
+        }
+        spv::Id dword_index = builder_->createBinOp(spv::OpShiftRightLogical, type_uint_, slot,
+                                                    builder_->makeUintConstant(1));
+        id_vector_temp_util_.clear();
+        id_vector_temp_util_.push_back(const_int_0_);
+        id_vector_temp_util_.push_back(builder_->createBinOp(
+            spv::OpShiftRightLogical, type_uint_, dword_index, builder_->makeUintConstant(2)));
+        id_vector_temp_util_.push_back(builder_->createBinOp(
+            spv::OpBitwiseAnd, type_uint_, dword_index, builder_->makeUintConstant(3)));
+        spv::Id page_dword = builder_->createLoad(
+            builder_->createAccessChain(spv::StorageClassPushConstant, push_float_constant_pages_,
+                                        id_vector_temp_util_),
+            spv::NoPrecision);
+        spv::Id shift = builder_->createBinOp(
+            spv::OpShiftLeftLogical, type_uint_,
+            builder_->createBinOp(spv::OpBitwiseAnd, type_uint_, slot,
+                                  builder_->makeUintConstant(1)),
+            builder_->makeUintConstant(4));
+        spv::Id page = builder_->createBinOp(
+            spv::OpBitwiseAnd, type_uint_,
+            builder_->createBinOp(spv::OpShiftRightLogical, type_uint_, page_dword, shift),
+            builder_->makeUintConstant(0xFFFF));
+        spv::Id heap_index = builder_->createBinOp(
+            spv::OpBitwiseOr, type_uint_,
+            builder_->createBinOp(spv::OpShiftLeftLogical, type_uint_, page,
+                                  builder_->makeUintConstant(4)),
+            builder_->createBinOp(spv::OpBitwiseAnd, type_uint_, register_index,
+                                  builder_->makeUintConstant(kFloatConstantPageRegisters - 1)));
+        id_vector_temp_util_.clear();
+        id_vector_temp_util_.push_back(const_int_0_);
+        id_vector_temp_util_.push_back(heap_index);
+        vec4_pointer = builder_->createAccessChain(spv::StorageClassStorageBuffer,
+                                                   uniform_float_constants_, id_vector_temp_util_);
+        break;
+      }
       id_vector_temp_util_.clear();
       // The first and the only structure member.
       id_vector_temp_util_.push_back(const_int_0_);

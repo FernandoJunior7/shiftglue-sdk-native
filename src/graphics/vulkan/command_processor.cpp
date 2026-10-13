@@ -764,9 +764,11 @@ const VkDescriptorPoolSize VulkanCommandProcessor::kDescriptorPoolSizeUniformBuf
     VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
     SpirvShaderTranslator::kConstantBufferCount* kLinkedTypeDescriptorPoolSetCount};
 
-const VkDescriptorPoolSize VulkanCommandProcessor::kDescriptorPoolSizeUniformBufferDynamic = {
-    VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
-    SpirvShaderTranslator::kConstantBufferCount* kLinkedTypeDescriptorPoolSetCount};
+const VkDescriptorPoolSize VulkanCommandProcessor::kDescriptorPoolSizeUniformBufferDynamic[2] = {
+    {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
+     SpirvShaderTranslator::kConstantBufferCount* kLinkedTypeDescriptorPoolSetCount},
+    {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, 2 * kLinkedTypeDescriptorPoolSetCount},
+};
 
 const VkDescriptorPoolSize VulkanCommandProcessor::kDescriptorPoolSizeStorageBuffer = {
     VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2 * kLinkedTypeDescriptorPoolSetCount};
@@ -790,7 +792,7 @@ VulkanCommandProcessor::VulkanCommandProcessor(VulkanGraphicsSystem* graphics_sy
       transient_descriptor_allocator_uniform_buffer_dynamic_(
           static_cast<const ui::vulkan::VulkanProvider*>(graphics_system->provider())
               ->vulkan_device(),
-          &kDescriptorPoolSizeUniformBufferDynamic, 1, kLinkedTypeDescriptorPoolSetCount),
+          kDescriptorPoolSizeUniformBufferDynamic, 2, kLinkedTypeDescriptorPoolSetCount),
       transient_descriptor_allocator_storage_buffer_(
           static_cast<const ui::vulkan::VulkanProvider*>(graphics_system->provider())
               ->vulkan_device(),
@@ -870,6 +872,10 @@ void VulkanCommandProcessor::DrawCostFrame() {
                              c.uploads[i] ? double(c.bytes[i]) / double(c.uploads[i]) : 0.0,
                              c.uploads[i] ? 100.0 * double(c.repeats[i]) / double(c.uploads[i])
                                           : 0.0);
+      }
+      if (paged_float_constants_) {
+        parts += fmt::format(" float pages reused unchanged: {:.2f} a draw",
+                             double(c.float_pages_reused) / double(std::max<uint64_t>(c.draws, 1)));
       }
       REXGPU_INFO("Constant census (RR-2.1) over 600 frames, {} draws:{}", c.draws, parts);
       constant_census_ = {};
@@ -1364,6 +1370,18 @@ bool VulkanCommandProcessor::SetupContext() {
       rex::align(std::max(ui::GraphicsUploadBufferPool::kDefaultPageSize, size_t(16384)),
                  size_t(device_properties.minUniformBufferOffsetAlignment)),
       REXCVAR_GET(vulkan_cached_uniform_memory));
+  paged_float_constants_ = SpirvShaderTranslator::Features(vulkan_device).paged_float_constants;
+  if (paged_float_constants_) {
+    // Page indices are 16-bit.
+    float_page_heap_size_ =
+        std::min(size_t(SpirvShaderTranslator::kFloatConstantPageBytes) << 16,
+                 size_t(std::min(device_properties.maxStorageBufferRange, UINT32_C(1) << 22)));
+    float_page_pool_ = std::make_unique<ui::vulkan::VulkanUploadBufferPool>(
+        vulkan_device, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, float_page_heap_size_,
+        REXCVAR_GET(vulkan_cached_uniform_memory));
+    InvalidateFloatConstantPages();
+    REXGPU_INFO("Paged float constants (NL-3.3): {} KiB heaps", float_page_heap_size_ >> 10);
+  }
 
   // Descriptor set layouts that don't depend on the setup of other subsystems.
   VkShaderStageFlags guest_shader_stages =
@@ -1401,6 +1419,13 @@ bool VulkanCommandProcessor::SetupContext() {
       .stageFlags = guest_shader_vertex_stages_;
   descriptor_set_layout_bindings_constants[SpirvShaderTranslator::kConstantBufferFloatPixel]
       .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+  if (paged_float_constants_) {
+    // The heap of pages.
+    descriptor_set_layout_bindings_constants[SpirvShaderTranslator::kConstantBufferFloatVertex]
+        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC;
+    descriptor_set_layout_bindings_constants[SpirvShaderTranslator::kConstantBufferFloatPixel]
+        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC;
+  }
   descriptor_set_layout_bindings_constants[SpirvShaderTranslator::kConstantBufferBoolLoop]
       .stageFlags = guest_shader_stages;
   descriptor_set_layout_bindings_constants[SpirvShaderTranslator::kConstantBufferFetch].stageFlags =
@@ -2778,6 +2803,7 @@ void VulkanCommandProcessor::ResetCachedDrawState() {
   std::memset(&system_constants_, 0, sizeof(system_constants_));
   system_constants_memo_valid_ = false;
   current_constant_buffers_up_to_date_ = 0;
+  InvalidateFloatConstantPages();
   std::memset(current_float_constant_map_vertex_, 0, sizeof(current_float_constant_map_vertex_));
   std::memset(current_float_constant_map_pixel_, 0, sizeof(current_float_constant_map_pixel_));
 }
@@ -2972,6 +2998,7 @@ void VulkanCommandProcessor::ShutdownContext() {
                                          descriptor_set_layout_empty_);
 
   uniform_buffer_pool_.reset();
+  float_page_pool_.reset();
 
   sparse_bind_wait_stage_mask_ = 0;
   sparse_buffer_binds_.clear();
@@ -3050,6 +3077,7 @@ void VulkanCommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
   if (index >= XE_GPU_REG_SHADER_CONSTANT_000_X && index <= XE_GPU_REG_SHADER_CONSTANT_511_W) {
     if (frame_open_) {
       uint32_t float_constant_index = (index - XE_GPU_REG_SHADER_CONSTANT_000_X) >> 2;
+      float_pages_valid_ &= ~(UINT32_C(1) << (float_constant_index >> 4));
       if (float_constant_index >= 256) {
         float_constant_index -= 256;
         if (current_float_constant_map_pixel_[float_constant_index >> 6] &
@@ -3135,6 +3163,7 @@ void VulkanCommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_
     if (frame_open_) {
       uint32_t first_float_constant = (start_index - XE_GPU_REG_SHADER_CONSTANT_000_X) >> 2;
       uint32_t last_float_constant = (end_index - XE_GPU_REG_SHADER_CONSTANT_000_X) >> 2;
+      FloatConstantsWritten(first_float_constant, last_float_constant);
       if (first_float_constant < 256) {
         uint32_t last_vertex_constant = std::min(last_float_constant, 255u);
         if (range_has_any_constant_usage(current_float_constant_map_vertex_, first_float_constant,
@@ -3245,6 +3274,7 @@ void VulkanCommandProcessor::WriteRegistersHost(uint32_t start_index, const uint
     if (frame_open_) {
       uint32_t first_float_constant = (start_index - XE_GPU_REG_SHADER_CONSTANT_000_X) >> 2;
       uint32_t last_float_constant = (end_index - XE_GPU_REG_SHADER_CONSTANT_000_X) >> 2;
+      FloatConstantsWritten(first_float_constant, last_float_constant);
       if (first_float_constant < 256) {
         uint32_t last_vertex_constant = std::min(last_float_constant, 255u);
         if (range_has_any_constant_usage(current_float_constant_map_vertex_, first_float_constant,
@@ -4903,8 +4933,14 @@ const VulkanPipelineCache::PipelineLayoutProvider* VulkanCommandProcessor::GetPi
   pipeline_layout_create_info.flags = 0;
   pipeline_layout_create_info.setLayoutCount = uint32_t(rex::countof(descriptor_set_layouts));
   pipeline_layout_create_info.pSetLayouts = descriptor_set_layouts;
-  pipeline_layout_create_info.pushConstantRangeCount = 0;
-  pipeline_layout_create_info.pPushConstantRanges = nullptr;
+  // NL-3.3: the page table of paged float constants.
+  VkPushConstantRange float_page_table_range;
+  float_page_table_range.stageFlags = guest_shader_vertex_stages_ | VK_SHADER_STAGE_FRAGMENT_BIT;
+  float_page_table_range.offset = 0;
+  float_page_table_range.size = SpirvShaderTranslator::kFloatConstantPageTableBytes;
+  pipeline_layout_create_info.pushConstantRangeCount = paged_float_constants_ ? 1 : 0;
+  pipeline_layout_create_info.pPushConstantRanges =
+      paged_float_constants_ ? &float_page_table_range : nullptr;
   VkPipelineLayout pipeline_layout;
   if (dfn.vkCreatePipelineLayout(device, &pipeline_layout_create_info, nullptr, &pipeline_layout) !=
       VK_SUCCESS) {
@@ -5026,6 +5062,8 @@ void VulkanCommandProcessor::BindExternalComputePipeline(VkPipeline pipeline) {
   if (current_external_compute_pipeline_ == pipeline) {
     return;
   }
+  // Its push constants may disturb the guest page table.
+  float_page_table_push_needed_ = true;
   deferred_command_buffer_.CmdVkBindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
   current_external_compute_pipeline_ = pipeline;
 }
@@ -5872,6 +5910,7 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
       // No or unknown pipeline layout previously bound - all bindings are in an
       // indeterminate state.
       current_graphics_descriptor_sets_bound_up_to_date_ = 0;
+      float_page_table_push_needed_ = true;
     }
     current_guest_graphics_pipeline_layout_ = pipeline_layout;
   }
@@ -7294,6 +7333,7 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
     std::memset(current_float_constant_map_pixel_, 0, sizeof(current_float_constant_map_pixel_));
     std::memset(current_graphics_descriptor_sets_, 0, sizeof(current_graphics_descriptor_sets_));
     current_constant_buffers_up_to_date_ = 0;
+    InvalidateFloatConstantPages();
     current_graphics_descriptor_sets_[SpirvShaderTranslator::kDescriptorSetSharedMemoryAndEdram] =
         shared_memory_and_edram_descriptor_set_;
     current_graphics_descriptor_set_values_up_to_date_ =
@@ -7304,6 +7344,9 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
     // FIXME(Triang3l): This will result in a memory leak if the guest is not
     // presenting.
     uniform_buffer_pool_->Reclaim(frame_completed_);
+    if (float_page_pool_) {
+      float_page_pool_->Reclaim(frame_completed_);
+    }
     while (!single_transient_descriptors_used_.empty()) {
       const UsedSingleTransientDescriptor& used_transient_descriptor =
           single_transient_descriptors_used_.front();
@@ -7448,6 +7491,9 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
     shared_memory_->EndSubmission();
 
     uniform_buffer_pool_->FlushWrites();
+    if (float_page_pool_) {
+      float_page_pool_->FlushWrites();
+    }
 
     // Submit sparse binds earlier, before executing the deferred command
     // buffer, to reduce latency.
@@ -7585,6 +7631,10 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
       ClearTransientDescriptorPools();
 
       uniform_buffer_pool_->ClearCache();
+      if (float_page_pool_) {
+        float_page_pool_->ClearCache();
+        InvalidateFloatConstantPages();
+      }
 
       texture_cache_->ClearCache();
 
@@ -9030,6 +9080,89 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
   } else {
     std::memset(current_float_constant_map_pixel_, 0, sizeof(current_float_constant_map_pixel_));
   }
+  if (paged_float_constants_) {
+    // NL-3.3: copy the used pages written since their last copy.
+    auto used_pages = [](const uint64_t* bitmap) {
+      uint32_t pages = 0;
+      for (uint32_t i = 0; i < 16; ++i) {
+        pages |= uint32_t((bitmap[i >> 2] >> ((i & 3) << 4)) & 0xFFFF ? 1 : 0) << i;
+      }
+      return pages;
+    };
+    const uint32_t used = used_pages(current_float_constant_map_vertex_) |
+                          (used_pages(current_float_constant_map_pixel_) << 16);
+    // The float bindings need a heap even if no shader reads one.
+    uint32_t needed = float_page_heap_buffer_ != VK_NULL_HANDLE ? used & ~float_pages_valid_
+                                                                : used | 1;
+    uint32_t page_slot;
+    // Rewritten with the same values: the copy in the heap still holds them.
+    uint32_t reusable = needed & float_pages_in_heap_;
+    while (rex::bit_scan_forward(reusable, &page_slot)) {
+      reusable &= ~(UINT32_C(1) << page_slot);
+      if (!std::memcmp(float_page_shadow_[page_slot],
+                       &regs.values[XE_GPU_REG_SHADER_CONSTANT_000_X + page_slot * 64],
+                       SpirvShaderTranslator::kFloatConstantPageBytes)) {
+        needed &= ~(UINT32_C(1) << page_slot);
+        float_pages_valid_ |= UINT32_C(1) << page_slot;
+        constant_census_.float_pages_reused += constant_census_enabled_;
+      }
+    }
+    while (rex::bit_scan_forward(needed, &page_slot)) {
+      // Consecutive slots are consecutive registers: one copy for the run.
+      const uint32_t page_run = uint32_t(std::countr_one(needed >> page_slot));
+      VkBuffer heap_buffer;
+      VkDeviceSize heap_offset;
+      uint8_t* mapping = float_page_pool_->Request(
+          frame_current_, SpirvShaderTranslator::kFloatConstantPageBytes * page_run,
+          SpirvShaderTranslator::kFloatConstantPageBytes, heap_buffer, heap_offset);
+      if (!mapping) {
+        return false;
+      }
+      if (heap_buffer != float_page_heap_buffer_) {
+        // A new heap: every page is copied to it again.
+        float_page_heap_buffer_ = heap_buffer;
+        float_pages_valid_ = 0;
+        float_pages_in_heap_ = 0;
+        for (uint32_t i : {SpirvShaderTranslator::kConstantBufferFloatVertex,
+                           SpirvShaderTranslator::kConstantBufferFloatPixel}) {
+          VkDescriptorBufferInfo& buffer_info = current_constant_buffer_infos_[i];
+          buffer_info.buffer = heap_buffer;
+          buffer_info.offset = 0;
+          buffer_info.range = VkDeviceSize(float_page_heap_size_);
+        }
+        current_graphics_descriptor_set_values_up_to_date_ &=
+            ~(UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetConstants);
+        if ((needed | used) != needed) {
+          // The runs change; this request's space is left unused.
+          needed |= used;
+          continue;
+        }
+      }
+      // Slot n holds registers 16n-16n+15 of the 512 (pixel from 256).
+      const uint32_t page_bytes = SpirvShaderTranslator::kFloatConstantPageBytes * page_run;
+      std::memcpy(mapping, &regs.values[XE_GPU_REG_SHADER_CONSTANT_000_X + page_slot * 64],
+                  page_bytes);
+      std::memcpy(float_page_shadow_[page_slot],
+                  &regs.values[XE_GPU_REG_SHADER_CONSTANT_000_X + page_slot * 64], page_bytes);
+      if (constant_census_enabled_) {
+        CountConstantUpload(page_slot < 16 ? 1 : 2, mapping, page_bytes);
+      }
+      const uint32_t first_page =
+          uint32_t(heap_offset / SpirvShaderTranslator::kFloatConstantPageBytes);
+      for (uint32_t k = 0; k < page_run; ++k) {
+        float_page_table_[page_slot + k] = uint16_t(first_page + k);
+      }
+      float_page_table_dirty_ = true;
+      const uint32_t run_mask = uint32_t((uint64_t(1) << (page_slot + page_run)) - 1) &
+                                ~((UINT32_C(1) << page_slot) - 1);
+      float_pages_valid_ |= run_mask;
+      float_pages_in_heap_ |= run_mask;
+      needed &= ~run_mask;
+    }
+    current_constant_buffers_up_to_date_ |=
+        (UINT32_C(1) << SpirvShaderTranslator::kConstantBufferFloatVertex) |
+        (UINT32_C(1) << SpirvShaderTranslator::kConstantBufferFloatPixel);
+  }
 
   // Write the new constant buffers.
   constexpr uint32_t kAllConstantBuffersMask =
@@ -9492,11 +9625,15 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
         constants_descriptor_set = constants_transient_descriptors_free_.back();
         constants_transient_descriptors_free_.pop_back();
       } else {
-        VkDescriptorPoolSize constants_descriptor_count;
-        constants_descriptor_count.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
-        constants_descriptor_count.descriptorCount = SpirvShaderTranslator::kConstantBufferCount;
+        VkDescriptorPoolSize constants_descriptor_counts[2];
+        constants_descriptor_counts[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+        constants_descriptor_counts[0].descriptorCount =
+            SpirvShaderTranslator::kConstantBufferCount - (paged_float_constants_ ? 2 : 0);
+        constants_descriptor_counts[1].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC;
+        constants_descriptor_counts[1].descriptorCount = 2;
         constants_descriptor_set = transient_descriptor_allocator_uniform_buffer_dynamic_.Allocate(
-            descriptor_set_layout_constants_, &constants_descriptor_count, 1);
+            descriptor_set_layout_constants_, constants_descriptor_counts,
+            paged_float_constants_ ? 2 : 1);
         if (constants_descriptor_set == VK_NULL_HANDLE) {
           return false;
         }
@@ -9518,7 +9655,11 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
         write_constants.dstBinding = i;
         write_constants.dstArrayElement = 0;
         write_constants.descriptorCount = 1;
-        write_constants.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+        write_constants.descriptorType =
+            paged_float_constants_ && (i == SpirvShaderTranslator::kConstantBufferFloatVertex ||
+                                       i == SpirvShaderTranslator::kConstantBufferFloatPixel)
+                ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC
+                : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
         write_constants.pImageInfo = nullptr;
         write_constants.pBufferInfo = &buffer_info;
         write_constants.pTexelBufferView = nullptr;
@@ -9627,6 +9768,14 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
     descriptor_sets_remaining &= ~((UINT32_C(1) << descriptor_set_mask_tzcnt) - 1);
   }
   current_graphics_descriptor_sets_bound_up_to_date_ |= descriptor_sets_needed;
+  if (paged_float_constants_ && (float_page_table_dirty_ || float_page_table_push_needed_)) {
+    deferred_command_buffer_.CmdVkPushConstants(
+        current_guest_graphics_pipeline_layout_->GetPipelineLayout(),
+        guest_shader_vertex_stages_ | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+        SpirvShaderTranslator::kFloatConstantPageTableBytes, float_page_table_);
+    float_page_table_dirty_ = false;
+    float_page_table_push_needed_ = false;
+  }
   if (push_pixel_textures) {
     if (pixel_textures_push_needed) {
       deferred_command_buffer_.CmdVkPushTextureDescriptorSet(
