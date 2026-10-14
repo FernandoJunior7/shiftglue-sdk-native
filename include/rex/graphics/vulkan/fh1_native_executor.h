@@ -523,11 +523,13 @@ class Fh1NativeExecutor {
     kGpuPhases
   };
   static constexpr uint32_t kGpuProfileSlots = 16;
-  static constexpr uint32_t kGpuProfileQueries = 8192;
+  static constexpr uint32_t kGpuProfileQueries = 32768;
   struct GpuProfileSlot {
     uint32_t used = 0;
     uint64_t submission = 0;
     bool pending = false;
+    // Drains that found the frame's queries unavailable.
+    uint32_t retries = 0;
     // Phase, first query, last query.
     std::vector<std::array<uint32_t, 3>> spans;
   };
@@ -549,6 +551,8 @@ class Fh1NativeExecutor {
   VkQueryPool gpu_query_pool_ = VK_NULL_HANDLE;
   std::array<GpuProfileSlot, kGpuProfileSlots> gpu_slots_;
   uint32_t gpu_slot_ = 0;
+  // Frames whose queries never became available, since the last report.
+  uint32_t gpu_dropped_frames_ = 0;
   std::array<uint64_t, kGpuPhases> gpu_ticks_{};
   // With the profile, the time from each draw rendering's start to the next
   // one's, by the rendering's surfaces (spans with phase kGpuPhases + label).

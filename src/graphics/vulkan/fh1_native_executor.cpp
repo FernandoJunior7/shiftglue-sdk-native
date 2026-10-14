@@ -3230,9 +3230,10 @@ void Fh1NativeExecutor::LogStats(uint64_t frame) {
     const double tick_ns = command_processor_.GetVulkanDevice()->properties().timestampPeriod;
     const double scale = tick_ns / 1e6 / double(gpu_frames_);
     REXGPU_INFO(
-        "FH1 native executor (Vulkan) gpu ms/frame over {} frames: frame {:.3f} transfers "
-        "{:.3f} resolves {:.3f} clears {:.3f} texture_reloads {:.3f} texture_loads {:.3f}",
-        gpu_frames_, gpu_ticks_[kGpuFrame] * scale, gpu_ticks_[kGpuTransfers] * scale,
+        "FH1 native executor (Vulkan) gpu ms/frame over {} frames ({} dropped): frame {:.3f} "
+        "transfers {:.3f} resolves {:.3f} clears {:.3f} texture_reloads {:.3f} texture_loads "
+        "{:.3f}",
+        gpu_frames_, gpu_dropped_frames_, gpu_ticks_[kGpuFrame] * scale, gpu_ticks_[kGpuTransfers] * scale,
         gpu_ticks_[kGpuResolves] * scale, gpu_ticks_[kGpuClears] * scale,
         gpu_ticks_[kGpuTextureReloads] * scale, gpu_ticks_[kGpuTextureLoads] * scale);
     std::vector<std::pair<uint64_t, uint32_t>> heavy;
@@ -3262,6 +3263,7 @@ void Fh1NativeExecutor::LogStats(uint64_t frame) {
     std::fill(gpu_label_counts_.begin(), gpu_label_counts_.end(), 0);
     gpu_ticks_ = {};
     gpu_frames_ = 0;
+    gpu_dropped_frames_ = 0;
   }
   if (!transfer_volume_.empty()) {
     std::vector<std::pair<uint64_t, std::string>> volume;
@@ -3327,7 +3329,9 @@ uint32_t Fh1NativeExecutor::GpuBegin() {
                                        base);
     slot.used = 1;
   }
-  if (slot.used + 2 > kGpuProfileQueries) return UINT32_MAX;
+  // The last query stays for the frame's end (GpuEndFrame), so a full slot
+  // still closes.
+  if (slot.used + 3 > kGpuProfileQueries) return UINT32_MAX;
   const uint32_t query = slot.used++;
   command_buffer.CmdVkWriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, gpu_query_pool_,
                                      base + query);
@@ -3337,7 +3341,7 @@ uint32_t Fh1NativeExecutor::GpuBegin() {
 void Fh1NativeExecutor::GpuEnd(GpuPhase phase, uint32_t begin) {
   if (begin == UINT32_MAX) return;
   GpuProfileSlot& slot = gpu_slots_[gpu_slot_];
-  if (slot.used >= kGpuProfileQueries) return;
+  if (slot.used + 1 >= kGpuProfileQueries) return;
   const uint32_t query = slot.used++;
   command_processor_.deferred_command_buffer().CmdVkWriteTimestamp(
       VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, gpu_query_pool_,
@@ -3403,29 +3407,63 @@ void Fh1NativeExecutor::GpuDrain() {
   for (uint32_t index = 0; index < kGpuProfileSlots; ++index) {
     GpuProfileSlot& slot = gpu_slots_[index];
     if (!slot.pending || slot.submission > completed) continue;
-    ticks.resize(slot.used);
+    // Each query's value and availability: a query the frame wrote but the
+    // driver reports unavailable (Turnip, in the untiled race) costs only the
+    // spans that use it, not the whole frame.
+    ticks.resize(size_t(slot.used) * 2);
     const VkResult result = vulkan_device->functions().vkGetQueryPoolResults(
         vulkan_device->device(), gpu_query_pool_, index * kGpuProfileQueries, slot.used,
-        ticks.size() * sizeof(uint64_t), ticks.data(), sizeof(uint64_t), VK_QUERY_RESULT_64_BIT);
-    if (result != VK_SUCCESS) {
+        ticks.size() * sizeof(uint64_t), ticks.data(), 2 * sizeof(uint64_t),
+        VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+    uint32_t unavailable = 0;
+    for (uint32_t query = 0; query < slot.used; ++query) {
+      unavailable += !ticks[size_t(query) * 2 + 1];
+    }
+    if (result != VK_SUCCESS && result != VK_NOT_READY) {
       static bool warned = false;
       if (!warned) {
         warned = true;
         REXGPU_WARN("FH1 native executor (Vulkan): GPU profile results failed ({}), {} queries",
                     int(result), slot.used);
       }
+    } else if (unavailable && slot.retries < 8) {
+      // Timestamps that land in a later submission than the one the slot
+      // waited on: read the slot again at the next swap.
+      ++slot.retries;
+      continue;
+    } else if (unavailable) {
+      static uint32_t warned = 0;
+      if (warned < 4) {
+        ++warned;
+        uint32_t first = 0;
+        while (first < slot.used && ticks[size_t(first) * 2 + 1]) ++first;
+        REXGPU_WARN(
+            "FH1 native executor (Vulkan): GPU profile: {} of {} queries unavailable after {} "
+            "swaps (first {})",
+            unavailable, slot.used, slot.retries, first);
+      }
     }
-    if (result == VK_SUCCESS) {
+    const auto available = [&](uint32_t query) { return ticks[size_t(query) * 2 + 1] != 0; };
+    const auto tick = [&](uint32_t query) { return ticks[size_t(query) * 2]; };
+    bool frame_measured = false;
+    for (const auto& span : slot.spans) {
+      if (span[0] == uint32_t(kGpuFrame) && available(span[1]) && available(span[2])) {
+        frame_measured = true;
+      }
+    }
+    if ((result == VK_SUCCESS || result == VK_NOT_READY) && frame_measured) {
       for (const auto& [phase, begin, end] : slot.spans) {
-        if (ticks[end] <= ticks[begin]) continue;
+        if (!available(begin) || !available(end) || tick(end) <= tick(begin)) continue;
         if (phase < kGpuPhases) {
-          gpu_ticks_[phase] += ticks[end] - ticks[begin];
+          gpu_ticks_[phase] += tick(end) - tick(begin);
         } else if (phase - kGpuPhases < gpu_label_ticks_.size()) {
-          gpu_label_ticks_[phase - kGpuPhases] += ticks[end] - ticks[begin];
+          gpu_label_ticks_[phase - kGpuPhases] += tick(end) - tick(begin);
           ++gpu_label_counts_[phase - kGpuPhases];
         }
       }
       ++gpu_frames_;
+    } else {
+      ++gpu_dropped_frames_;
     }
     slot = GpuProfileSlot();
   }

@@ -3369,12 +3369,14 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
   }
   if (fh1_native_executor_) {
     fh1_native_executor_->OnSwap(frame_current_);
+    // The frame's GPU profile ends before the swap's own work: commands
+    // recorded after the presenter has ended the submission are never
+    // submitted, so the frame's last timestamps never became available.
+    fh1_native_executor_->GpuFrameSwapped();
   }
 
   if (!graphics_system_) {
-    // Frame replays: still a frame, for the GPU profile and the frames in
-    // flight.
-    if (fh1_native_executor_) fh1_native_executor_->GpuFrameSwapped();
+    // Frame replays: still a frame, for the frames in flight.
     EndSubmission(true);
     return;
   }
@@ -3429,7 +3431,6 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
           "usage in this frame");
     }
     swap_gpu_timing.End();
-    if (fh1_native_executor_) fh1_native_executor_->GpuFrameSwapped();
     EndSubmission(true);
     return;
   }
@@ -4133,7 +4134,6 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
   // End the frame even if did not present for any reason (the image refresher
   // was not called), to prevent leaking per-frame resources.
   swap_gpu_timing.End();
-    if (fh1_native_executor_) fh1_native_executor_->GpuFrameSwapped();
   EndSubmission(true);
 }
 
