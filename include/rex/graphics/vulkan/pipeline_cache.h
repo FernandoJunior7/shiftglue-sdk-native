@@ -541,6 +541,9 @@ class VulkanPipelineCache {
   std::atomic<uint64_t> vk_pipeline_cache_creations_{0};
   uint64_t vk_pipeline_cache_saved_creations_ = 0;
   uint64_t vk_pipeline_cache_saved_time_ms_ = 0;
+  // The GPU commands thread's view: the creation count of the last save it
+  // requested (the save itself runs on the storage write thread).
+  uint64_t vk_pipeline_cache_requested_creations_ = 0;
   void LoadVkPipelineCache();
   void SaveVkPipelineCache();
 
@@ -569,6 +572,7 @@ class VulkanPipelineCache {
   std::deque<SpecializedStoredDescription> storage_write_specialized_queue_;
   bool storage_write_flush_shaders_ = false;
   bool storage_write_flush_pipelines_ = false;
+  bool storage_write_save_vk_pipeline_cache_ = false;
   bool storage_write_thread_shutdown_ = false;
   std::unique_ptr<rex::thread::Thread> storage_write_thread_;
 

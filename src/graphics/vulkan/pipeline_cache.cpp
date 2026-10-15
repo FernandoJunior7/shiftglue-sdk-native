@@ -1101,12 +1101,25 @@ void VulkanPipelineCache::SaveVkPipelineCache() {
 void VulkanPipelineCache::EndSubmission() {
   // Every 30 seconds while new pipelines appear: the process may end without
   // reaching the shutdown save (Android stops apps; the host exits quickly).
+  // The storage write thread saves it: reading the driver's cache and writing
+  // tens of megabytes here held this thread 30-40 ms (an Odin 2 Portal frame
+  // every 30 s of play).
+  const uint64_t vk_pipeline_cache_creations =
+      vk_pipeline_cache_creations_.load(std::memory_order_relaxed);
   if (vk_pipeline_cache_ != VK_NULL_HANDLE &&
-      vk_pipeline_cache_creations_.load(std::memory_order_relaxed) !=
-          vk_pipeline_cache_saved_creations_ &&
+      vk_pipeline_cache_creations != vk_pipeline_cache_requested_creations_ &&
       rex::chrono::Clock::QueryHostUptimeMillis() - vk_pipeline_cache_saved_time_ms_ >
           30000) {
-    SaveVkPipelineCache();
+    vk_pipeline_cache_requested_creations_ = vk_pipeline_cache_creations;
+    if (storage_write_thread_) {
+      {
+        std::lock_guard<std::mutex> lock(storage_write_request_lock_);
+        storage_write_save_vk_pipeline_cache_ = true;
+      }
+      storage_write_request_cond_.notify_one();
+    } else {
+      SaveVkPipelineCache();
+    }
     vk_pipeline_cache_saved_time_ms_ = rex::chrono::Clock::QueryHostUptimeMillis();
   }
   if (shader_storage_file_flush_needed_ || pipeline_storage_file_flush_needed_) {
@@ -4640,8 +4653,13 @@ void VulkanPipelineCache::StorageWriteThread() {
 
   bool flush_shaders = false;
   bool flush_pipelines = false;
+  bool save_vk_pipeline_cache = false;
 
   while (true) {
+    if (save_vk_pipeline_cache) {
+      save_vk_pipeline_cache = false;
+      SaveVkPipelineCache();
+    }
     if (flush_shaders) {
       flush_shaders = false;
       assert_not_null(shader_storage_file_);
@@ -4683,7 +4701,11 @@ void VulkanPipelineCache::StorageWriteThread() {
         storage_write_flush_pipelines_ = false;
         flush_pipelines = true;
       }
-      if (!shader && !write_pipeline && !write_specialized) {
+      if (storage_write_save_vk_pipeline_cache_) {
+        storage_write_save_vk_pipeline_cache_ = false;
+        save_vk_pipeline_cache = true;
+      }
+      if (!shader && !write_pipeline && !write_specialized && !save_vk_pipeline_cache) {
         storage_write_request_cond_.wait(lock);
         continue;
       }
