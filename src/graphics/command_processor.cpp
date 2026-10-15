@@ -144,10 +144,13 @@ struct WaitRegMemPolicy {
 // after a 200 us yield took 2.3-3.5 ms less decoder CPU a race frame than
 // the former 2 ms yield, with a p95 about 0.9 ms lower, on 16, 8 and 4
 // threads of a Ryzen 7 5800X. Above 60 the wake-up latency cost 3 % of the
-// frame rate at 120, so faster rates keep the 2 ms yield (NP-9.3).
+// frame rate at 120, so faster rates keep the 2 ms yield (NP-9.3). macOS
+// takes the Windows choice: its short sleeps overshoot under load, and on an
+// M4 Pro free-roam drive the 100 us sleeps gave 187 frames over 25 ms and a
+// p99 of 41.8 ms against 23 frames and 19.8 ms with the 2 ms yield.
 WaitRegMemPolicy CurrentWaitRegMemPolicy() {
   WaitRegMemPolicy policy{REXCVAR_GET(wait_reg_mem_yield_us), REXCVAR_GET(wait_reg_mem_sleep_us)};
-#if REX_PLATFORM_WIN32
+#if REX_PLATFORM_WIN32 || REX_PLATFORM_MAC
   if (policy.yield_us < 0 || policy.sleep_us < 0) {
     // The game rate's settings live in other modules: read them by name,
     // at most twice a second (the decoder thread is the only caller).
