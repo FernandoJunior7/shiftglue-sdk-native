@@ -63,6 +63,12 @@ REXCVAR_DEFINE_INT32(vulkan_async_pipeline_wait_ms, REX_PLATFORM_ANDROID ? 0 : 2
                      "as menu backgrounds")
     .range(0, 5000)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(vulkan_log_pipeline_waits_ms, 0, "GPU/Vulkan",
+                     "Diagnostics: log each draw that waits at least this many milliseconds for "
+                     "a pipeline a worker is still building (its shaders, whether it is an "
+                     "object slot variant, and whether the wait ran out); 0 turns it off")
+    .range(0, 5000)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DECLARE(std::string, fh1_resolve_dump_dir);
 REXCVAR_DECLARE(int32_t, gpu_trace_bins_vblank);
 // On macOS an in-run A/B on an M4 Pro drive gives about 0.8 ms a frame.
@@ -3420,6 +3426,14 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
     AwaitSubmissionWorker();
   }
 
+  if (pending_pipeline_binds_) {
+    if (REXCVAR_GET(vulkan_log_pipeline_waits_ms) > 0) {
+      REXGPU_INFO("Frame recorded {} draws with pipelines still being built",
+                  pending_pipeline_binds_);
+    }
+    pending_pipeline_binds_ = 0;
+  }
+
   bool skip_present_due_async_placeholder = REXCVAR_GET(async_shader_compilation) &&
                                             REXCVAR_GET(vulkan_async_skip_incomplete_frames) &&
                                             frame_used_async_placeholder_pipeline_;
@@ -5685,7 +5699,16 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
   // may happen between pipeline configuration and binding.
   pipeline_cache_->GetPipelineAndLayoutByHandle(pipeline_handle, pipeline, pipeline_layout_provider,
                                                 &pipeline_is_placeholder);
-  if (REXCVAR_GET(async_shader_compilation) && pipeline_is_placeholder) {
+  // vulkan_async_pipeline_bind_on_replay: recorded with the pipeline bound
+  // when the submission replays, so the recorder moves on and asks for the
+  // next draw's pipeline while the workers build this one.
+  const bool bind_pending_pipeline = REXCVAR_GET(async_shader_compilation) &&
+                                     pipeline_is_placeholder &&
+                                     pipeline_cache_->binds_on_replay() &&
+                                     pipeline_layout_provider != nullptr;
+  if (bind_pending_pipeline) {
+    ++pending_pipeline_binds_;
+  } else if (REXCVAR_GET(async_shader_compilation) && pipeline_is_placeholder) {
     // A skipped draw is missing from its render targets, and a resolve of
     // them keeps the gap in a texture until the title draws that texture
     // again: menu and event backgrounds stayed corrupted (issue #328). Give
@@ -5693,13 +5716,22 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
     // for the workers at its end anyway.
     const int32_t wait_ms = REXCVAR_GET(vulkan_async_pipeline_wait_ms);
     if (wait_ms > 0) {
-      const auto deadline =
-          std::chrono::steady_clock::now() + std::chrono::milliseconds(wait_ms);
+      const auto wait_start = std::chrono::steady_clock::now();
+      const auto deadline = wait_start + std::chrono::milliseconds(wait_ms);
       while (pipeline_is_placeholder && std::chrono::steady_clock::now() < deadline) {
         std::this_thread::sleep_for(std::chrono::microseconds(200));
         pipeline_cache_->GetPipelineAndLayoutByHandle(pipeline_handle, pipeline,
                                                       pipeline_layout_provider,
                                                       &pipeline_is_placeholder);
+      }
+      const auto waited = std::chrono::steady_clock::now() - wait_start;
+      if (const int32_t log_ms = REXCVAR_GET(vulkan_log_pipeline_waits_ms);
+          log_ms > 0 && waited >= std::chrono::milliseconds(log_ms)) {
+        REXGPU_WARN("Draw waited {:.1f} ms for pipeline VS {:016X} PS {:016X} ({})",
+                    std::chrono::duration<double, std::milli>(waited).count(),
+                    vertex_shader->ucode_data_hash(),
+                    pixel_shader ? pixel_shader->ucode_data_hash() : 0,
+                    pipeline_is_placeholder ? "skipped" : "built");
       }
     }
     if (pipeline_is_placeholder) {
@@ -5707,10 +5739,16 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
       return true;
     }
   }
-  if (pipeline == VK_NULL_HANDLE || pipeline_layout_provider == nullptr) {
+  if (pipeline_layout_provider == nullptr ||
+      (pipeline == VK_NULL_HANDLE && !bind_pending_pipeline)) {
     return draw_fail("pipeline_lookup");
   }
-  if (current_guest_graphics_pipeline_ != pipeline) {
+  if (bind_pending_pipeline) {
+    deferred_command_buffer_.CmdBindPendingGraphicsPipeline(pipeline_handle);
+    // Unknown until the replay: the next draw binds again.
+    current_guest_graphics_pipeline_ = VK_NULL_HANDLE;
+    current_external_graphics_pipeline_ = VK_NULL_HANDLE;
+  } else if (current_guest_graphics_pipeline_ != pipeline) {
     deferred_command_buffer_.CmdVkBindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
     current_guest_graphics_pipeline_ = pipeline;
     current_external_graphics_pipeline_ = VK_NULL_HANDLE;
@@ -7724,6 +7762,18 @@ void VulkanCommandProcessor::AwaitSubmissionWorkerSubmitted(uint64_t submission)
                    std::chrono::duration_cast<std::chrono::nanoseconds>(
                        std::chrono::steady_clock::now() - wait_start)
                        .count());
+}
+
+VkPipeline VulkanCommandProcessor::AwaitPendingGraphicsPipeline(void* handle) const {
+  double waited_ms = 0.0;
+  VkPipeline pipeline = pipeline_cache_->AwaitPipeline(
+      handle, REXCVAR_GET(vulkan_async_pipeline_wait_ms), &waited_ms);
+  if (const int32_t log_ms = REXCVAR_GET(vulkan_log_pipeline_waits_ms);
+      log_ms > 0 && waited_ms >= double(log_ms)) {
+    REXGPU_WARN("Replay waited {:.1f} ms for a pipeline ({})", waited_ms,
+                pipeline != VK_NULL_HANDLE ? "built" : "skipped");
+  }
+  return pipeline;
 }
 
 void VulkanCommandProcessor::AwaitSubmissionWorker() {

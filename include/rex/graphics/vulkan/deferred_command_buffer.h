@@ -111,6 +111,14 @@ class DeferredCommandBuffer {
     args.pipeline = pipeline;
   }
 
+  // Binds the pipeline behind a VulkanPipelineCache handle that a worker may
+  // still be building; the replay waits for it (or skips the draws after it).
+  void CmdBindPendingGraphicsPipeline(void* handle) {
+    auto& args = *reinterpret_cast<ArgsBindPendingGraphicsPipeline*>(WriteCommand(
+        Command::kBindPendingGraphicsPipeline, sizeof(ArgsBindPendingGraphicsPipeline)));
+    args.handle = handle;
+  }
+
   void CmdVkBindVertexBuffers(uint32_t first_binding, uint32_t binding_count,
                               const VkBuffer* buffers, const VkDeviceSize* offsets) {
     size_t arguments_size = rex::align(sizeof(ArgsVkBindVertexBuffers), alignof(VkBuffer));
@@ -440,6 +448,7 @@ class DeferredCommandBuffer {
     kVkBindDescriptorSets,
     kVkBindIndexBuffer,
     kVkBindPipeline,
+    kBindPendingGraphicsPipeline,
     kVkBindVertexBuffers,
     kVkClearAttachments,
     kVkClearColorImage,
@@ -530,6 +539,10 @@ class DeferredCommandBuffer {
   struct ArgsVkBindPipeline {
     VkPipelineBindPoint pipeline_bind_point;
     VkPipeline pipeline;
+  };
+
+  struct ArgsBindPendingGraphicsPipeline {
+    void* handle;
   };
 
   struct ArgsVkBindVertexBuffers {

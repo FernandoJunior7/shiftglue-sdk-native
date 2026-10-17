@@ -114,6 +114,12 @@ class VulkanPipelineCache {
       VulkanRenderTargetCache::RenderPassKey render_pass_key, VkPipeline& pipeline_out,
       const PipelineLayoutProvider*& pipeline_layout_out, void** pipeline_handle_out = nullptr);
   bool IsCreatingPipelines() const;
+  // vulkan_async_pipeline_bind_on_replay: draws record a pipeline that is
+  // still being built, bound by AwaitPipeline when the submission replays.
+  bool binds_on_replay() const { return bind_on_replay_; }
+  // Waits up to wait_ms for the pipeline behind a ConfigurePipeline handle;
+  // VK_NULL_HANDLE when it is still not built or failed.
+  VkPipeline AwaitPipeline(void* handle, int32_t wait_ms, double* waited_ms_out = nullptr) const;
   void GetPipelineAndLayoutByHandle(void* handle, VkPipeline& pipeline_out,
                                     const PipelineLayoutProvider*& pipeline_layout_out,
                                     bool* is_placeholder_out = nullptr) const;
@@ -435,6 +441,9 @@ class VulkanPipelineCache {
   // vulkan_async_shader_translation: one worker, so that a shader's first
   // translation, which sets its bindings, is never racing another one.
   bool async_translation_ = false;
+  bool bind_on_replay_ = false;
+  // vulkan_async_pipeline_no_placeholder, or implied by bind_on_replay_.
+  bool no_placeholder_ = false;
   std::unique_ptr<SpirvShaderTranslator> async_shader_translator_;
   std::unique_ptr<rex::thread::Thread> translation_thread_;
   std::mutex translation_mutex_;

@@ -41,6 +41,9 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
       command_processor_.GetVulkanDevice()->functions();
   const uintmax_t* stream = command_stream_.data();
   size_t stream_remaining = command_stream_.size();
+  // A pipeline that was still being built when its draws were recorded and is
+  // still missing now: those draws are left out until the next bind.
+  bool skip_graphics_draws = false;
   while (stream_remaining) {
     const CommandHeader& header = *reinterpret_cast<const CommandHeader*>(stream);
     stream += kCommandHeaderSizeElements;
@@ -100,6 +103,18 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
       case Command::kVkBindPipeline: {
         auto& args = *reinterpret_cast<const ArgsVkBindPipeline*>(stream);
         dfn.vkCmdBindPipeline(command_buffer, args.pipeline_bind_point, args.pipeline);
+        if (args.pipeline_bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS) {
+          skip_graphics_draws = false;
+        }
+      } break;
+
+      case Command::kBindPendingGraphicsPipeline: {
+        auto& args = *reinterpret_cast<const ArgsBindPendingGraphicsPipeline*>(stream);
+        VkPipeline pipeline = command_processor_.AwaitPendingGraphicsPipeline(args.handle);
+        skip_graphics_draws = pipeline == VK_NULL_HANDLE;
+        if (!skip_graphics_draws) {
+          dfn.vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+        }
       } break;
 
       case Command::kVkBindVertexBuffers: {
@@ -182,12 +197,18 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
       } break;
 
       case Command::kVkDraw: {
+        if (skip_graphics_draws) {
+          break;
+        }
         auto& args = *reinterpret_cast<const ArgsVkDraw*>(stream);
         dfn.vkCmdDraw(command_buffer, args.vertex_count, args.instance_count, args.first_vertex,
                       args.first_instance);
       } break;
 
       case Command::kVkDrawIndexed: {
+        if (skip_graphics_draws) {
+          break;
+        }
         auto& args = *reinterpret_cast<const ArgsVkDrawIndexed*>(stream);
         dfn.vkCmdDrawIndexed(command_buffer, args.index_count, args.instance_count,
                              args.first_index, args.vertex_offset, args.first_instance);

@@ -331,6 +331,9 @@ class VulkanCommandProcessor : public CommandProcessor {
   VkPipelineCache UsePersistentVkPipelineCache() {
     return pipeline_cache_ ? pipeline_cache_->UsePersistentVkPipelineCache() : VK_NULL_HANDLE;
   }
+  // A pending pipeline bind of the replayed submission: the pipeline once a
+  // worker has built it, or VK_NULL_HANDLE to skip its draws.
+  VkPipeline AwaitPendingGraphicsPipeline(void* handle) const;
   const VulkanPipelineCache::PipelineLayoutProvider* GetPipelineLayout(size_t texture_count_pixel,
                                                                        size_t sampler_count_pixel,
                                                                        size_t texture_count_vertex,
@@ -1159,6 +1162,9 @@ class VulkanCommandProcessor : public CommandProcessor {
   VkPipeline swap_hud_mask_pipeline_ = VK_NULL_HANDLE;
   VkDescriptorPool swap_hud_mask_descriptor_pool_ = VK_NULL_HANDLE;
   std::array<VkDescriptorSet, kMaxFramesInFlight> swap_hud_mask_descriptor_sets_{};
+  // Draws of the current frame recorded with a pipeline still being built
+  // (vulkan_async_pipeline_bind_on_replay).
+  uint32_t pending_pipeline_binds_ = 0;
   VkPipelineLayout resolve_downscale_pipeline_layout_ = VK_NULL_HANDLE;
   VkPipeline resolve_downscale_pipeline_ = VK_NULL_HANDLE;
   VkBuffer resolve_downscale_buffer_ = VK_NULL_HANDLE;
