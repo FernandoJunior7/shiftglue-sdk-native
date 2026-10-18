@@ -49,6 +49,11 @@ set(REXUI_VULKAN_SOURCES
     vulkan/vulkan_upload_buffer_pool.cpp
     vulkan/vulkan_util.cpp
 )
+if(APPLE)
+    list(APPEND REXUI_VULKAN_SOURCES vulkan/metalfx_upscaler.mm)
+    set_source_files_properties(vulkan/metalfx_upscaler.mm PROPERTIES
+        SKIP_PRECOMPILE_HEADERS ON)
+endif()
 
 # D3D12 UI backend
 if(REXGLUE_USE_D3D12)
@@ -178,7 +183,8 @@ elseif(UNIX AND NOT APPLE)
         ${WAYLAND_LIBRARIES}
     )
 elseif(APPLE)
-    target_link_libraries(rexui PRIVATE "-framework CoreFoundation")
+    target_link_libraries(rexui PRIVATE "-framework CoreFoundation" "-framework Metal"
+        "-framework MetalFX")
 endif()
 
 if(WIN32)

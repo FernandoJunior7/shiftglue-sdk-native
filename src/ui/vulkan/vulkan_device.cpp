@@ -431,6 +431,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     }
     // #106, for HDR10 output (present_hdr).
     XE_UI_VULKAN_STRUCT_EXTENSION(EXT_hdr_metadata)
+#if REX_PLATFORM_MAC
+    XE_UI_VULKAN_STRUCT_EXTENSION(EXT_metal_objects)
+#endif
   }
 
   bool ext_1_2_KHR_sampler_mirror_clamp_to_edge = false;

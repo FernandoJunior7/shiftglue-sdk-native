@@ -228,6 +228,7 @@ class Presenter {
       // inputs in the presenter path.
       kFsr3,
 #endif
+      kMetalFx,
     };
 
 #if defined(REX_HAS_FIDELITYFX_SDK)
@@ -465,6 +466,7 @@ class Presenter {
     kFsrRcas,
     kFsrRcasDither,
 #endif
+    kMetalFx,
 
     kCount,
   };
@@ -490,6 +492,8 @@ class Presenter {
 
   static constexpr bool CanGuestOutputPaintEffectBeFinal(GuestOutputPaintEffect effect) {
     switch (effect) {
+      case GuestOutputPaintEffect::kMetalFx:
+        return false;
 #if defined(REX_HAS_FIDELITYFX_SDK)
       case GuestOutputPaintEffect::kFsrEasu:
         return false;
@@ -708,6 +712,7 @@ class Presenter {
                                                uint32_t host_rt_width, uint32_t host_rt_height,
                                                uint32_t max_rt_width, uint32_t max_rt_height,
                                                const GuestOutputPaintConfig& config) const;
+  bool metalfx_supported_ = false;
   // Records the rectangle of a flow about to be painted, or of no guest output
   // for null, for GetPaintedGuestOutputRectFromUIThread.
   void SetPaintedGuestOutputRect(const GuestOutputPaintFlow* flow);

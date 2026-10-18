@@ -66,8 +66,9 @@ REXCVAR_DEFINE_STRING(present_effect, "bilinear", "UI/Presenter",
 #else
 REXCVAR_DEFINE_STRING(present_effect, "bilinear", "UI/Presenter",
                       "Guest output effect: bilinear, cas (sharpen, and resample when "
-                      "downscaling), fsr (FSR 1 upscale with RCAS sharpening)")
-    .allowed({"bilinear", "cas", "fsr"});
+                      "downscaling), fsr (FSR 1 upscale with RCAS sharpening), metalfx (MetalFX "
+                      "spatial upscale on macOS, bilinear elsewhere)")
+    .allowed({"bilinear", "cas", "fsr", "metalfx"});
 #endif
 
 REXCVAR_DEFINE_DOUBLE(present_cas_additional_sharpness,
@@ -123,6 +124,9 @@ GuestOutputPaintConfig::Effect ParsePresentEffect(const std::string& effect_name
     return GuestOutputPaintConfig::Effect::kFsr3;
   }
 #endif
+  if (lowered == "metalfx") {
+    return GuestOutputPaintConfig::Effect::kMetalFx;
+  }
   return GuestOutputPaintConfig::Effect::kBilinear;
 }
 
@@ -1203,6 +1207,20 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
     }
   }
 #endif  // defined(REX_HAS_FIDELITYFX_SDK)
+
+  if (config.GetEffect() == GuestOutputPaintConfig::Effect::kMetalFx && metalfx_supported_) {
+    const std::pair<uint32_t, uint32_t> input_size =
+        flow.effect_count ? flow.effect_output_sizes[flow.effect_count - 1]
+                          : std::make_pair(properties.frontbuffer_width,
+                                           properties.frontbuffer_height);
+    if (input_size.first < output_width_clamped || input_size.second < output_height_clamped) {
+      flow.effect_output_sizes[flow.effect_count] =
+          std::make_pair(output_width_clamped, output_height_clamped);
+      flow.effects[flow.effect_count++] = GuestOutputPaintEffect::kMetalFx;
+      flow.effect_output_sizes[flow.effect_count] = std::make_pair(output_width, output_height);
+      flow.effects[flow.effect_count++] = GuestOutputPaintEffect::kBilinear;
+    }
+  }
 
   std::pair<uint32_t, uint32_t>* last_pre_bilinear_effect_size =
       flow.effect_count ? &flow.effect_output_sizes[flow.effect_count - 1] : nullptr;

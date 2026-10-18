@@ -23,6 +23,9 @@
 #include <rex/ui/surface.h>
 #include <rex/ui/vulkan/device.h>
 #include <rex/ui/vulkan/instance.h>
+#if REX_PLATFORM_MAC
+#include <rex/ui/vulkan/metalfx_upscaler.h>
+#endif
 #include <rex/ui/vulkan/submission_tracker.h>
 #include <rex/ui/vulkan/ui_samplers.h>
 
@@ -544,6 +547,9 @@ class VulkanPresenter final : public Presenter {
   // DisconnectPaintingFromSurfaceFromUIThreadImpl) by the thread doing it, as
   // well as by presenter initialization and shutdown.
   PaintContext paint_context_;
+#if REX_PLATFORM_MAC
+  std::unique_ptr<MetalFxUpscaler> metalfx_;
+#endif
 
 #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
   void* temporal_upscaler_context_ = nullptr;

@@ -2150,7 +2150,8 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
         // Check if all the intermediate effects are supported by the
         // implementation.
         for (size_t i = 0; i + 1 < guest_output_flow.effect_count; ++i) {
-          if (paint_context_.guest_output_paint_pipelines[size_t(guest_output_flow.effects[i])]
+          if (guest_output_flow.effects[i] != GuestOutputPaintEffect::kMetalFx &&
+              paint_context_.guest_output_paint_pipelines[size_t(guest_output_flow.effects[i])]
                   .intermediate_pipeline == VK_NULL_HANDLE) {
             guest_output_flow.effect_count = 0;
             break;
@@ -2237,6 +2238,18 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
             guest_output_flow.output_y = 0;
             guest_output_flow.letterbox_clear_rectangle_count = 0;
           }
+#if REX_PLATFORM_MAC
+          if (effect == GuestOutputPaintEffect::kMetalFx) {
+            uint32_t effect_input_width = 0, effect_input_height = 0;
+            guest_output_flow.GetEffectInputSize(i, effect_input_width, effect_input_height);
+            metalfx_->Encode(i ? paint_context_.guest_output_intermediate_images[i - 1]->image()
+                               : guest_output_image->image(),
+                             effect_input_width, effect_input_height,
+                             paint_context_.guest_output_intermediate_images[i]->image(),
+                             effect_rect_size.first, effect_rect_size.second);
+            continue;
+          }
+#endif
 #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
           bool use_temporal_upscaler =
               temporal_effect_selected && effect == GuestOutputPaintEffect::kFsrEasu;
@@ -2629,6 +2642,9 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
     {
       const VulkanDevice::Queue::Acquisition queue_acquisition =
           vulkan_device_->AcquireQueue(vulkan_device_->queue_family_graphics_compute(), 0);
+#if REX_PLATFORM_MAC
+      if (metalfx_) metalfx_->Commit();
+#endif
       submit_result =
           dfn.vkQueueSubmit(queue_acquisition.queue(), 1, &submit_info, fence_acqusition.fence());
       if (ui_fence_acquisition.fence() != VK_NULL_HANDLE && submit_result == VK_SUCCESS) {
@@ -3018,6 +3034,10 @@ bool VulkanPresenter::InitializeSurfaceIndependent() {
     return false;
   }
 
+#if REX_PLATFORM_MAC
+  metalfx_ = MetalFxUpscaler::Create(vulkan_device_);
+  metalfx_supported_ = metalfx_ != nullptr;
+#endif
   return InitializeCommonSurfaceIndependent();
 }
 

@@ -71,9 +71,10 @@ REXCVAR_DEFINE_BOOL(fh1_merge_subset_renderings, false, "GPU",
                     "reloads the attachments at every rendering boundary)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_STRING(fh1_debug_ab_cvar, "", "GPU",
-                      "Diagnostics: flip these boolean cvars (comma-separated) at the end of "
-                      "every stats window (fh1_native_stats_frames), so both values run under "
-                      "the same thermal state; each window's stats name the value it ran with")
+                      "Diagnostics: at the end of every stats window (fh1_native_stats_frames), "
+                      "flip these boolean cvars, or alternate name=a|b ones, comma-separated, "
+                      "so both run under the same thermal state; each window's stats name the "
+                      "state it ran with (true: on, or the a values)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(fh1_msaa_2x, false, "GPU",
                     "Store FH1's 4x MSAA surfaces with 2 host samples (its top and bottom "
@@ -149,7 +150,7 @@ REXCVAR_DEFINE_BOOL(fh1_debug_skip_clears, false, "GPU",
 REXCVAR_DEFINE_BOOL(fh1_debug_skip_resolve_dispatches, false, "GPU",
                     "Diagnostics: keep every resolve's barriers but not its compute dispatch "
                     "(wrong image), to bound what the resolve shaders cost (Vulkan)")
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 #if REX_HAS_D3D12
 REXCVAR_DECLARE(std::string, fh1_resolve_dump_dir);
 REXCVAR_DECLARE(int32_t, fh1_resolve_dump_frame);
@@ -3283,13 +3284,21 @@ void Fh1NativeExecutor::DestroyHudSnapshot() {
 void Fh1NativeExecutor::LogStats(uint64_t frame) {
   const std::string ab_cvars = REXCVAR_GET(fh1_debug_ab_cvar);
   if (!ab_cvars.empty()) {
-    const std::string first = ab_cvars.substr(0, ab_cvars.find(','));
-    const std::string ab_value = rex::cvar::GetFlagByName(first);
-    REXGPU_INFO("FH1 native executor (Vulkan) window ran with {}={}", ab_cvars, ab_value);
+    const bool flip = ++ab_windows_ & 1;
+    REXGPU_INFO("FH1 native executor (Vulkan) window ran with {}={}", ab_cvars,
+                flip ? "false" : "true");
     for (size_t start = 0; start < ab_cvars.size();) {
       const size_t end = std::min(ab_cvars.find(',', start), ab_cvars.size());
-      rex::cvar::SetFlagByName(ab_cvars.substr(start, end - start),
-                               ab_value == "true" ? "false" : "true");
+      const std::string entry = ab_cvars.substr(start, end - start);
+      const size_t equals = entry.find('=');
+      const size_t bar = entry.find('|');
+      if (equals != std::string::npos && bar != std::string::npos) {
+        rex::cvar::SetFlagByName(entry.substr(0, equals),
+                                 flip ? entry.substr(equals + 1, bar - equals - 1)
+                                      : entry.substr(bar + 1));
+      } else {
+        rex::cvar::SetFlagByName(entry, flip ? "true" : "false");
+      }
       start = end + 1;
     }
   }

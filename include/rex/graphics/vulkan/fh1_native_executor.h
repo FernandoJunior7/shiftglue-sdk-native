@@ -460,6 +460,7 @@ class Fh1NativeExecutor {
   uint64_t open_draw_rendering_id_ = 0;
   uint32_t open_draw_bits_ = 0;
   uint64_t stats_frame_ = 0;
+  uint64_t ab_windows_ = 0;
   SurfaceKey open_draw_keys_[1 + xenos::kMaxColorRenderTargets];
   // fh1_coarse_shading, parsed at swaps, and the rate of each draw rendering.
   void UpdateCoarseShading();
