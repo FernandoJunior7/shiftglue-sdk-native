@@ -20,6 +20,7 @@
 #include <rex/graphics/register_file.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/vulkan/command_processor.h>
+#include <rex/graphics/vulkan/metal_gpu_timing.h>
 #include <rex/graphics/vulkan/shared_memory.h>
 #include <rex/graphics/vulkan/texture_cache.h>
 #include <rex/graphics/xenos.h>
@@ -54,6 +55,26 @@ REXCVAR_DEFINE_BOOL(fh1_scaled_msaa_single_sample, false, "GPU",
                     "host sample. Much less GPU work at 3x and 4x; edges lose their MSAA")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+REXCVAR_DEFINE_BOOL(fh1_metal_gpu_time, true, "GPU",
+                    "Time every Metal command buffer on the GPU (macOS): the "
+                    "metal_gpu_busy_ns performance column and the executor's per-frame GPU "
+                    "busy stats")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(fh1_metal_encoder_profile, false, "GPU",
+                    "Diagnostics: with fh1_metal_gpu_time, time every Metal encoder at its "
+                    "stage boundaries and log the costliest by attachments every stats window")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(fh1_merge_subset_renderings, false, "GPU",
+                    "Draw into the open rendering when the draw's targets are a subset of its "
+                    "attachments (depth-only draws between depth and color draws), the others "
+                    "bound with nothing written, instead of ending it (a tiler stores and "
+                    "reloads the attachments at every rendering boundary)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_STRING(fh1_debug_ab_cvar, "", "GPU",
+                      "Diagnostics: flip these boolean cvars (comma-separated) at the end of "
+                      "every stats window (fh1_native_stats_frames), so both values run under "
+                      "the same thermal state; each window's stats name the value it ran with")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(fh1_msaa_2x, false, "GPU",
                     "Store FH1's 4x MSAA surfaces with 2 host samples (its top and bottom "
                     "sample pairs each in one): smoother edges than fh1_msaa_single_sample "
@@ -433,6 +454,10 @@ bool Fh1NativeExecutor::Initialize(const Fh1VulkanExecutorConfig& config) {
   config_ = config;
   if (!config_.memory || !config_.textures || !config_.render_targets) return false;
   async_specialize_ = REXCVAR_GET(fh1_async_specialized_passes);
+#if REX_PLATFORM_MAC
+  metal_gpu_timed_ = REXCVAR_GET(fh1_metal_gpu_time) &&
+                     StartMetalGpuTiming(REXCVAR_GET(fh1_metal_encoder_profile));
+#endif
   scale_ = config_.textures->draw_resolution_scale_x();
   untile_height_ = config_.untile_height;
   UpdateCoarseShading();
@@ -755,6 +780,7 @@ void Fh1NativeExecutor::BeginSurfaceRendering(Surface& surface, bool uint_view) 
       (uint64_t(1) << 63) | (uint64_t(surface.key.Pack()) << 1) | uint64_t(uint_view);
   rendering_id_ = 0;
   command_processor_.SubmitBarriersAndBeginFh1Rendering(info, id);
+  draw_rendering_surfaces_.clear();
 }
 
 void Fh1NativeExecutor::EndUntiledTiling() {
@@ -1382,10 +1408,8 @@ void Fh1NativeExecutor::TransferRects(Surface& dest, uint32_t previous_owner, co
     if (!source_stencil) Count("transfer_stencil_skipped");
   }
   counters_.Count("transfer_tile_passes", uint64_t(tile_count) * pass_count);
-  if (gpu_query_pool_ != VK_NULL_HANDLE) {
-    transfer_volume_[source->key.Describe() + "->" + dest.key.Describe()] +=
-        uint64_t(tile_count) * pass_count;
-  }
+  transfer_volume_[source->key.Describe() + "->" + dest.key.Describe()] +=
+      uint64_t(tile_count) * pass_count;
   for (uint32_t i = 0; i < rect_count; ++i) {
     pending_transfers_.push_back({dest.key.Pack(), previous_owner, rects[i], source_stencil});
   }
@@ -2084,8 +2108,27 @@ bool Fh1NativeExecutor::BindTargets(VulkanRenderTargetCache::RenderPassKey& key_
     Skip("draw_targets_not_prepared");
     return false;
   }
-  const uint32_t used_bits = pending_used_bits_;
+  uint32_t used_bits = pending_used_bits_;
   const SurfaceKey* keys = pending_keys_;
+  if (used_bits && used_bits != open_draw_bits_ && !(used_bits & ~open_draw_bits_) &&
+      REXCVAR_GET(fh1_merge_subset_renderings) &&
+      command_processor_.IsFh1RenderingOpen(open_draw_rendering_id_)) {
+    bool same = true;
+    for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+      if (used_bits & (1u << i)) {
+        same &= keys[i].Pack() == open_draw_keys_[i].Pack();
+      } else if (open_draw_bits_ & (1u << i)) {
+        same &= FindSurface(open_draw_keys_[i].Pack()) != nullptr;
+      }
+    }
+    if (same) {
+      for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+        if (open_draw_bits_ & ~used_bits & (1u << i)) pending_keys_[i] = open_draw_keys_[i];
+      }
+      used_bits = open_draw_bits_;
+      Count("draw_merged_into_open_rendering");
+    }
+  }
   const uint64_t rendering_id = DrawRenderingId(used_bits);
   key_out.msaa_samples = single_sample_msaa_
                              ? xenos::MsaaSamples::k1X
@@ -2280,6 +2323,16 @@ void Fh1NativeExecutor::BeginDrawRendering() {
     GpuMarkRendering(GpuLabel(label));
   }
   command_processor_.SubmitBarriersAndBeginFh1Rendering(info, id);
+  open_draw_rendering_id_ = id;
+  open_draw_bits_ = bound_bits_;
+  std::copy(std::begin(pending_keys_), std::end(pending_keys_), std::begin(open_draw_keys_));
+  draw_rendering_surfaces_.clear();
+  for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+    if (!(bound_bits_ & (1u << i))) continue;
+    if (!draw_rendering_surfaces_.empty()) draw_rendering_surfaces_ += '+';
+    draw_rendering_surfaces_ += pending_keys_[i].Describe();
+  }
+  if (draw_rendering_surfaces_.empty()) draw_rendering_surfaces_ = "none";
   if (clears) FoldPendingClears(bound, clear_width, clear_height, nullptr, nullptr, false);
 }
 
@@ -3103,6 +3156,13 @@ void Fh1NativeExecutor::OnSwap(uint64_t frame) {
   if (!initialized_) return;
   UpdateCoarseShading();
   GpuDrain();
+#if REX_PLATFORM_MAC
+  if (metal_gpu_timed_) {
+    const uint64_t busy = MetalGpuBusyNs();
+    metal_frame_busy_ns_.push_back(uint32_t(std::min<uint64_t>(busy - metal_busy_seen_, UINT32_MAX)));
+    metal_busy_seen_ = busy;
+  }
+#endif
   frame_ = frame;
   if (frame % uint64_t(REXCVAR_GET(fh1_native_stats_frames)) == 0) LogStats(frame);
 }
@@ -3221,6 +3281,18 @@ void Fh1NativeExecutor::DestroyHudSnapshot() {
 }
 
 void Fh1NativeExecutor::LogStats(uint64_t frame) {
+  const std::string ab_cvars = REXCVAR_GET(fh1_debug_ab_cvar);
+  if (!ab_cvars.empty()) {
+    const std::string first = ab_cvars.substr(0, ab_cvars.find(','));
+    const std::string ab_value = rex::cvar::GetFlagByName(first);
+    REXGPU_INFO("FH1 native executor (Vulkan) window ran with {}={}", ab_cvars, ab_value);
+    for (size_t start = 0; start < ab_cvars.size();) {
+      const size_t end = std::min(ab_cvars.find(',', start), ab_cvars.size());
+      rex::cvar::SetFlagByName(ab_cvars.substr(start, end - start),
+                               ab_value == "true" ? "false" : "true");
+      start = end + 1;
+    }
+  }
   REXGPU_INFO(
       "FH1 native executor (Vulkan) frame={} draws={} resolves={} surfaces={} skips={{{}}} "
       "stats={{{}}}",
@@ -3270,10 +3342,12 @@ void Fh1NativeExecutor::LogStats(uint64_t frame) {
     for (const auto& [pair, tiles] : transfer_volume_) volume.emplace_back(tiles, pair);
     std::sort(volume.begin(), volume.end(), std::greater<>());
     std::string top;
-    for (size_t i = 0; i < volume.size() && i < 8; ++i) {
-      top += fmt::format("{}{}={}", i ? " " : "", volume[i].second, volume[i].first);
+    for (size_t i = 0; i < volume.size() && i < 12; ++i) {
+      top += fmt::format("{}{}={:.0f}", i ? " " : "", volume[i].second,
+                         double(volume[i].first) / double(std::max<uint64_t>(frame - stats_frame_, 1)));
     }
-    REXGPU_INFO("FH1 native executor (Vulkan) transfer tile-passes: {}", top);
+    stats_frame_ = frame;
+    REXGPU_INFO("FH1 native executor (Vulkan) transfer tile-passes per frame: {}", top);
     transfer_volume_.clear();
   }
   const uint64_t window_frames = frame >= 600 ? 600 : std::max<uint64_t>(frame, 1);
@@ -3302,7 +3376,55 @@ void Fh1NativeExecutor::LogStats(uint64_t frame) {
   if (!top.empty()) {
     REXGPU_INFO("FH1 native executor (Vulkan) renderings ended by other work, per frame: {}", top);
   }
+  if (!metal_frame_busy_ns_.empty()) {
+    std::vector<uint32_t> busy = std::move(metal_frame_busy_ns_);
+    metal_frame_busy_ns_.clear();
+    std::sort(busy.begin(), busy.end());
+    const auto at = [&](double p) {
+      return double(busy[std::min(busy.size() - 1, size_t(double(busy.size()) * p))]) / 1e6;
+    };
+    uint64_t sum = 0;
+    size_t over = 0;
+    for (uint32_t ns : busy) {
+      sum += ns;
+      over += ns > 16'666'667u;
+    }
+    REXGPU_INFO(
+        "FH1 native executor (Vulkan) Metal GPU busy ms per frame over {} frames: mean {:.2f} "
+        "p50 {:.2f} p95 {:.2f} p99 {:.2f} max {:.2f}, over 16.7 ms {:.1f}%",
+        busy.size(), double(sum) / 1e6 / double(busy.size()), at(0.5), at(0.95), at(0.99),
+        at(1.0), double(over) * 100.0 / double(busy.size()));
+#if REX_PLATFORM_MAC
+    const std::string encoders = TakeMetalEncoderProfile(busy.size(), 40);
+    if (!encoders.empty()) {
+      REXGPU_INFO("FH1 native executor (Vulkan) Metal encoders per frame: {}", encoders);
+    }
+#endif
+  }
+  if (!ended_draw_renderings_.empty()) {
+    std::vector<std::pair<uint64_t, std::string>> ended;
+    for (const auto& [key, count] : ended_draw_renderings_) {
+      std::string ender = key.second;
+      const size_t paren = ender.find('(');
+      if (paren != std::string::npos) ender.resize(paren);
+      const size_t space = ender.rfind(' ');
+      if (space != std::string::npos) ender.erase(0, space + 1);
+      ended.emplace_back(count, key.first + " by " + ender);
+    }
+    ended_draw_renderings_.clear();
+    std::sort(ended.begin(), ended.end(), std::greater<>());
+    std::string list;
+    for (size_t i = 0; i < ended.size() && i < 16; ++i) {
+      list += fmt::format("{}{:.1f} {}", i ? "; " : "", double(ended[i].first) * per_frame,
+                          ended[i].second);
+    }
+    REXGPU_INFO("FH1 native executor (Vulkan) draw renderings ended, per frame: {}", list);
+  }
   const auto uploads = command_processor_.TakeSharedMemoryUploads();
+  const auto texture_loads = command_processor_.TakeTextureLoads();
+  REXGPU_INFO(
+      "FH1 native executor (Vulkan) texture loads per frame: hoisted {:.1f}, in place {:.1f}",
+      double(texture_loads[1]) * per_frame, double(texture_loads[0]) * per_frame);
   REXGPU_INFO(
       "FH1 native executor (Vulkan) shared memory uploads per frame: hoisted {:.1f}, outside "
       "renderings {:.1f}, hoisting off {:.1f}, after a fence {:.1f}, after GPU writes {:.1f}{}",
@@ -3375,6 +3497,10 @@ void Fh1NativeExecutor::GpuMarkRendering(uint32_t label) {
 }
 
 void Fh1NativeExecutor::GpuRenderingEnded(const char* ender) {
+  if (!draw_rendering_surfaces_.empty()) {
+    ++ended_draw_renderings_[{std::move(draw_rendering_surfaces_), ender}];
+    draw_rendering_surfaces_.clear();
+  }
   if (gpu_query_pool_ == VK_NULL_HANDLE || gpu_rendering_label_ == UINT32_MAX) return;
   std::string name = ender;
   if (name.size() > 60) name = name.substr(0, 60);

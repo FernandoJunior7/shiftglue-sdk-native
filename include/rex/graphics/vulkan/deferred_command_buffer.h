@@ -10,7 +10,6 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
-#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -36,9 +35,12 @@ class DeferredCommandBuffer {
   void Swap(DeferredCommandBuffer& other) { command_stream_.swap(other.command_stream_); }
 
   size_t GetPosition() const { return command_stream_.size(); }
-  void MoveCommandsTo(size_t start, size_t position) {
-    std::rotate(command_stream_.begin() + position, command_stream_.begin() + start,
-                command_stream_.end());
+  void CutCommands(size_t start, std::vector<uintmax_t>& out) {
+    out.insert(out.end(), command_stream_.begin() + start, command_stream_.end());
+    command_stream_.resize(start);
+  }
+  void InsertCommands(size_t position, const std::vector<uintmax_t>& commands) {
+    command_stream_.insert(command_stream_.begin() + position, commands.begin(), commands.end());
   }
 
   // render_pass_begin->pNext of all barriers must be null.

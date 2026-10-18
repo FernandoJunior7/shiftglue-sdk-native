@@ -457,6 +457,10 @@ class Fh1NativeExecutor {
   uint32_t pending_used_bits_ = 0;
   SurfaceKey pending_keys_[1 + xenos::kMaxColorRenderTargets];
   uint32_t bound_bits_ = 0;
+  uint64_t open_draw_rendering_id_ = 0;
+  uint32_t open_draw_bits_ = 0;
+  uint64_t stats_frame_ = 0;
+  SurfaceKey open_draw_keys_[1 + xenos::kMaxColorRenderTargets];
   // fh1_coarse_shading, parsed at swaps, and the rate of each draw rendering.
   void UpdateCoarseShading();
   std::string coarse_shading_spec_;
@@ -501,6 +505,11 @@ class Fh1NativeExecutor {
   uint32_t recent_prepare_next_ = 0;
 
   uint64_t frame_ = 0;
+  std::vector<uint32_t> metal_frame_busy_ns_;
+  uint64_t metal_busy_seen_ = 0;
+  bool metal_gpu_timed_ = false;
+  std::string draw_rendering_surfaces_;
+  std::map<std::pair<std::string, const char*>, uint64_t> ended_draw_renderings_;
   // fh1_scaled_msaa_single_sample at a scale above 1x.
   bool single_sample_msaa_ = false;
   bool two_sample_msaa_ = false;

@@ -244,6 +244,9 @@ class VulkanTextureCache final : public TextureCache {
 
     VkImage image() const { return image_; }
 
+    uint64_t sampled_draw() const { return sampled_draw_; }
+    void set_sampled_draw(uint64_t draw) { sampled_draw_ = draw; }
+
     // Doesn't transition (the caller must insert the barrier).
     Usage SetUsage(Usage new_usage) {
       Usage old_usage = usage_;
@@ -330,6 +333,7 @@ class VulkanTextureCache final : public TextureCache {
     VkImageView copy_view_2d_ = VK_NULL_HANDLE;
 
     Usage usage_ = Usage::kUndefined;
+    uint64_t sampled_draw_ = 0;
 
     std::unordered_map<ViewKey, VkImageView, ViewKey::Hasher> views_;
     // The last view returned per signedness, by its GetView arguments: a

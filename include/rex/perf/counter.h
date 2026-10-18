@@ -171,6 +171,8 @@ enum class CounterId : uint16_t {
   kTextureCacheMb,
   kProcessResidentMb,
 
+  kMetalGpuBusyNs,
+
   kCount  // sentinel -- must be last
 };
 

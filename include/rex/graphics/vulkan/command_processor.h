@@ -239,6 +239,13 @@ class VulkanCommandProcessor : public CommandProcessor {
   std::array<uint64_t, kUploadKindCount> TakeSharedMemoryUploads() {
     return std::exchange(shared_memory_uploads_, {});
   }
+  bool BeginHoistScope();
+  void EndHoistScope();
+  bool hoist_scope_open() const { return hoist_scope_start_ != SIZE_MAX; }
+  uint64_t draw_serial() const { return draw_serial_; }
+  uint64_t hoist_first_draw() const { return hoist_first_draw_; }
+  void CountTextureLoad(bool hoisted) { ++texture_loads_[hoisted]; }
+  std::array<uint64_t, 2> TakeTextureLoads() { return std::exchange(texture_loads_, {}); }
   // Pipeline barrier commands and FH1 renderings recorded since the last call.
   Fh1NativeExecutor* GetFh1NativeExecutor() const { return fh1_native_executor_.get(); }
   uint64_t TakeBarrierBatchCount() { return std::exchange(barrier_batch_count_, 0); }
@@ -1424,8 +1431,14 @@ class VulkanCommandProcessor : public CommandProcessor {
   const VulkanRenderTargetCache::Framebuffer* current_framebuffer_;
   bool in_render_pass_ = false;
 
-  void FlushHoistedUploads();
+  void FlushHoistedUploads(bool keep_hoisting = false);
+  void CutHoistedUploads();
+  std::vector<uintmax_t> hoisted_commands_;
   size_t hoist_position_ = SIZE_MAX;
+  size_t hoist_scope_start_ = SIZE_MAX;
+  uint64_t draw_serial_ = 0;
+  uint64_t hoist_first_draw_ = 0;
+  std::array<uint64_t, 2> texture_loads_ = {};
   uint64_t hoist_signal_count_ = 0;
   VkBuffer hoist_destination_ = VK_NULL_HANDLE;
   std::vector<std::pair<VkBuffer, VkBufferCopy>> hoisted_copies_;

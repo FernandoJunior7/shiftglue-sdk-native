@@ -639,6 +639,7 @@ void VulkanTextureCache::RequestTextures(uint32_t used_texture_mask) {
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
 
+  const bool hoisting = command_processor_.BeginHoistScope();
   TextureCache::RequestTextures(used_texture_mask);
 
   // Transition the textures into the needed usage.
@@ -673,6 +674,7 @@ void VulkanTextureCache::RequestTextures(uint32_t used_texture_mask) {
     if (binding_texture != nullptr) {
       // Will be referenced by the command buffer, so mark as used.
       binding_texture->MarkAsUsed();
+      binding_texture->set_sampled_draw(command_processor_.draw_serial());
       if (REXCVAR_GET(fh1_texture_reload_probe) && binding_texture->GetGuestBaseSize() >= (1u << 20)) {
         const TextureKey& k = binding_texture->key();
         REXGPU_INFO("FH1 texture sampled {:X} base {:08X} format {} {}x{} endian {} outdated {} "
@@ -699,6 +701,7 @@ void VulkanTextureCache::RequestTextures(uint32_t used_texture_mask) {
     VulkanTexture* binding_texture_signed = static_cast<VulkanTexture*>(binding->texture_signed);
     if (binding_texture_signed != nullptr) {
       binding_texture_signed->MarkAsUsed();
+      binding_texture_signed->set_sampled_draw(command_processor_.draw_serial());
       VulkanTexture::Usage old_usage =
           binding_texture_signed->SetUsage(VulkanTexture::Usage::kGuestShaderSampled);
       if (old_usage != VulkanTexture::Usage::kGuestShaderSampled) {
@@ -712,6 +715,9 @@ void VulkanTextureCache::RequestTextures(uint32_t used_texture_mask) {
                                                   dst_access_mask, old_layout, new_layout);
       }
     }
+  }
+  if (hoisting) {
+    command_processor_.EndHoistScope();
   }
 }
 
@@ -1797,6 +1803,11 @@ bool VulkanTextureCache::EnsureScaledResolveMemoryCommitted(uint32_t start_unsca
 
 bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, bool load_base,
                                                                bool load_mips) {
+  if (command_processor_.hoist_scope_open() &&
+      static_cast<VulkanTexture&>(texture).sampled_draw() >= command_processor_.hoist_first_draw()) {
+    command_processor_.EndHoistScope();
+  }
+  command_processor_.CountTextureLoad(command_processor_.hoist_scope_open());
   // GPU time of the load for fh1_native_gpu_profile, split by resolve-sourced
   // reloads and other loads.
   Fh1NativeExecutor* const gpu_profile_executor = command_processor_.GetFh1NativeExecutor();

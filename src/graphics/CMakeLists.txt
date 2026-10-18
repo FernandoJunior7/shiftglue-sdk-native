@@ -66,6 +66,11 @@ set(REXGPU_XENOS_VULKAN_SOURCES
     vulkan/shared_memory.cpp
     vulkan/texture_cache.cpp
 )
+if(APPLE)
+    list(APPEND REXGPU_XENOS_VULKAN_SOURCES vulkan/metal_gpu_timing.mm)
+    set_source_files_properties(vulkan/metal_gpu_timing.mm PROPERTIES
+        COMPILE_OPTIONS -fobjc-arc SKIP_PRECOMPILE_HEADERS ON)
+endif()
 
 # D3D12 backend
 if(REXGLUE_USE_D3D12)
@@ -163,6 +168,9 @@ foreach(rexgpu_fh1_target IN ITEMS rexgpu-fh1 rexgpu-fh1-producer)
         xxHash::xxhash)
     if(WIN32)
         target_link_libraries(${rexgpu_fh1_target} PRIVATE bcrypt)
+    endif()
+    if(APPLE)
+        target_link_libraries(${rexgpu_fh1_target} PRIVATE "-framework Metal" "-framework Foundation")
     endif()
     if(REXGLUE_USE_D3D12)
         target_link_libraries(${rexgpu_fh1_target} PRIVATE d3d12 dxgi dxguid)
