@@ -291,7 +291,7 @@ std::string TakeMetalPresentationStats() {
   std::sort(sorted.begin(), sorted.end());
   const double refresh = sorted[sorted.size() / 2];
   size_t held = 0;
-  for (double interval : intervals) held += interval > refresh * 1.5;
+  for (double interval : intervals) held += interval > refresh * 1.25;
   return fmt::format(
       "{} frames shown, {} not shown, {} held over a refresh ({:.2f} %); interval p50 {:.2f} "
       "p99 {:.2f} max {:.2f} ms",
