@@ -30,6 +30,11 @@ NSUInteger sample_count = 0;
 std::atomic<uint64_t> next_sample{0};
 double ns_per_tick = 1.0;
 
+std::mutex presented_mutex;
+std::vector<double> presented_times;
+uint64_t presents_dropped = 0;
+IMP original_next_drawable = nullptr;
+
 IMP original_commit = nullptr;
 IMP original_render = nullptr;
 IMP original_compute = nullptr;
@@ -177,6 +182,20 @@ id BlitEncoder(id buffer, SEL) {
   return encoder;
 }
 
+id NextDrawable(id layer, SEL selector) {
+  id drawable = reinterpret_cast<id (*)(id, SEL)>(original_next_drawable)(layer, selector);
+  [(id<MTLDrawable>)drawable addPresentedHandler:^(id<MTLDrawable> presented) {
+    const double time = presented.presentedTime;
+    std::lock_guard<std::mutex> lock(presented_mutex);
+    if (time > 0) {
+      presented_times.push_back(time);
+    } else {
+      ++presents_dropped;
+    }
+  }];
+  return drawable;
+}
+
 IMP Replace(Class buffer_class, SEL selector, IMP replacement) {
   Method method = class_getInstanceMethod(buffer_class, selector);
   if (!method) return nullptr;
@@ -238,6 +257,10 @@ bool StartMetalGpuTiming(bool profile_encoders) {
       Class buffer_class = object_getClass(buffer);
       original_commit = Replace(buffer_class, @selector(commit), reinterpret_cast<IMP>(Commit));
       if (!original_commit) return;
+      if (Class layer_class = objc_getClass("CAMetalLayer")) {
+        original_next_drawable = Replace(layer_class, sel_registerName("nextDrawable"),
+                                         reinterpret_cast<IMP>(NextDrawable));
+      }
       started = true;
       const bool profiling = profile_encoders && StartEncoderProfile(device, buffer_class);
       REXGPU_INFO("Metal GPU timing on {}{}", class_getName(buffer_class),
@@ -250,6 +273,31 @@ bool StartMetalGpuTiming(bool profile_encoders) {
 }
 
 uint64_t MetalGpuBusyNs() { return busy_ns.load(std::memory_order_relaxed); }
+
+std::string TakeMetalPresentationStats() {
+  std::vector<double> times;
+  uint64_t dropped;
+  {
+    std::lock_guard<std::mutex> lock(presented_mutex);
+    times.swap(presented_times);
+    dropped = std::exchange(presents_dropped, 0);
+  }
+  if (times.size() < 3) return {};
+  std::sort(times.begin(), times.end());
+  std::vector<double> intervals;
+  for (size_t i = 1; i < times.size(); ++i) intervals.push_back((times[i] - times[i - 1]) * 1e3);
+  std::vector<double> sorted = intervals;
+  std::sort(sorted.begin(), sorted.end());
+  const double refresh = sorted[sorted.size() / 2];
+  size_t held = 0;
+  for (double interval : intervals) held += interval > refresh * 1.5;
+  return fmt::format(
+      "{} frames shown, {} not shown, {} held over a refresh ({:.2f} %); interval p50 {:.2f} "
+      "p99 {:.2f} max {:.2f} ms",
+      times.size(), dropped, held, double(held) * 100.0 / double(intervals.size()), refresh,
+      sorted[std::min(sorted.size() - 1, size_t(double(sorted.size()) * 0.99))],
+      sorted.back());
+}
 
 std::string TakeMetalEncoderProfile(uint64_t frames, size_t top) {
   std::map<std::string, EncoderStat> stats;

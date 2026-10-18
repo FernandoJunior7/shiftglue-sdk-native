@@ -3404,6 +3404,10 @@ void Fh1NativeExecutor::LogStats(uint64_t frame) {
         busy.size(), double(sum) / 1e6 / double(busy.size()), at(0.5), at(0.95), at(0.99),
         at(1.0), double(over) * 100.0 / double(busy.size()));
 #if REX_PLATFORM_MAC
+    const std::string presentation = TakeMetalPresentationStats();
+    if (!presentation.empty()) {
+      REXGPU_INFO("FH1 native executor (Vulkan) Metal display: {}", presentation);
+    }
     const std::string encoders = TakeMetalEncoderProfile(busy.size(), 40);
     if (!encoders.empty()) {
       REXGPU_INFO("FH1 native executor (Vulkan) Metal encoders per frame: {}", encoders);
