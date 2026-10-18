@@ -282,15 +282,21 @@ bool VulkanSharedMemory::UploadRanges(
   if (upload_page_ranges.empty()) {
     return true;
   }
-  // upload_page_ranges are sorted, use them to determine the range for the
-  // ordering barrier.
-  Use(Usage::kTransferDestination,
-      std::make_pair(upload_page_ranges.front().first << page_size_log2(),
-                     (upload_page_ranges.back().first + upload_page_ranges.back().second -
-                      upload_page_ranges.front().first)
-                         << page_size_log2()));
-  command_processor_.SubmitBarriers(true);
-  Fh1NativeExecutor* const gpu_profile_executor = command_processor_.GetFh1NativeExecutor();
+  const bool hoist = last_usage_ == Usage::kRead && !last_written_range_.second &&
+                     command_processor_.CanHoistSharedMemoryUpload();
+  command_processor_.CountSharedMemoryUpload(hoist);
+  if (!hoist) {
+    // upload_page_ranges are sorted, use them to determine the range for the
+    // ordering barrier.
+    Use(Usage::kTransferDestination,
+        std::make_pair(upload_page_ranges.front().first << page_size_log2(),
+                       (upload_page_ranges.back().first + upload_page_ranges.back().second -
+                        upload_page_ranges.front().first)
+                           << page_size_log2()));
+    command_processor_.SubmitBarriers(true);
+  }
+  Fh1NativeExecutor* const gpu_profile_executor =
+      hoist ? nullptr : command_processor_.GetFh1NativeExecutor();
   const uint64_t gpu_timing =
       gpu_profile_executor ? gpu_profile_executor->BeginLabelGpuTiming("upload") : UINT64_MAX;
   struct EndTiming {
@@ -330,8 +336,14 @@ bool VulkanSharedMemory::UploadRanges(
                   upload_buffer_size);
       if (upload_buffer_previous != upload_buffer && !upload_regions_.empty()) {
         assert_true(upload_buffer_previous != VK_NULL_HANDLE);
-        command_buffer.CmdVkCopyBuffer(upload_buffer_previous, buffer_,
-                                       uint32_t(upload_regions_.size()), upload_regions_.data());
+        if (hoist) {
+          command_processor_.HoistSharedMemoryUpload(upload_buffer_previous, buffer_,
+                                                     uint32_t(upload_regions_.size()),
+                                                     upload_regions_.data());
+        } else {
+          command_buffer.CmdVkCopyBuffer(upload_buffer_previous, buffer_,
+                                         uint32_t(upload_regions_.size()), upload_regions_.data());
+        }
         upload_regions_.clear();
       }
       upload_buffer_previous = upload_buffer;
@@ -349,8 +361,14 @@ bool VulkanSharedMemory::UploadRanges(
   }
   if (!upload_regions_.empty()) {
     assert_true(upload_buffer_previous != VK_NULL_HANDLE);
-    command_buffer.CmdVkCopyBuffer(upload_buffer_previous, buffer_,
-                                   uint32_t(upload_regions_.size()), upload_regions_.data());
+    if (hoist) {
+      command_processor_.HoistSharedMemoryUpload(upload_buffer_previous, buffer_,
+                                                 uint32_t(upload_regions_.size()),
+                                                 upload_regions_.data());
+    } else {
+      command_buffer.CmdVkCopyBuffer(upload_buffer_previous, buffer_,
+                                     uint32_t(upload_regions_.size()), upload_regions_.data());
+    }
     upload_regions_.clear();
   }
   return successful;

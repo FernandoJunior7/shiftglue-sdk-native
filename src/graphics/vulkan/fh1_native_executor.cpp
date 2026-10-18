@@ -9,6 +9,11 @@
 #include <fstream>
 
 #include <fmt/format.h>
+#include <rex/platform.h>
+#if REX_PLATFORM_MAC
+#include <objc/message.h>
+#include <objc/runtime.h>
+#endif
 
 #include <rex/cvar.h>
 #include <rex/graphics/flags.h>
@@ -23,6 +28,24 @@
 #include <rex/thread.h>
 #include <rex/system/thread_state.h>
 #include <rex/ui/vulkan/util.h>
+
+namespace {
+std::string ThermalStateNote() {
+#if REX_PLATFORM_MAC
+  Class process_info_class = objc_getClass("NSProcessInfo");
+  if (!process_info_class) return {};
+  id process_info = reinterpret_cast<id (*)(Class, SEL)>(objc_msgSend)(
+      process_info_class, sel_registerName("processInfo"));
+  if (!process_info) return {};
+  const long state = reinterpret_cast<long (*)(id, SEL)>(objc_msgSend)(
+      process_info, sel_registerName("thermalState"));
+  static constexpr const char* kNames[] = {"nominal", "fair", "serious", "critical"};
+  return fmt::format(", thermal state {}", state >= 0 && state < 4 ? kNames[state] : "unknown");
+#else
+  return {};
+#endif
+}
+}  // namespace
 
 
 REXCVAR_DEFINE_BOOL(fh1_scaled_msaa_single_sample, false, "GPU",
@@ -3277,6 +3300,16 @@ void Fh1NativeExecutor::LogStats(uint64_t frame) {
   if (!top.empty()) {
     REXGPU_INFO("FH1 native executor (Vulkan) renderings ended by other work, per frame: {}", top);
   }
+  const auto uploads = command_processor_.TakeSharedMemoryUploads();
+  REXGPU_INFO(
+      "FH1 native executor (Vulkan) shared memory uploads per frame: hoisted {:.1f}, outside "
+      "renderings {:.1f}, hoisting off {:.1f}, after a fence {:.1f}, after GPU writes {:.1f}{}",
+      double(uploads[VulkanCommandProcessor::kUploadHoisted]) * per_frame,
+      double(uploads[VulkanCommandProcessor::kUploadOutsideRendering]) * per_frame,
+      double(uploads[VulkanCommandProcessor::kUploadHoistingOff]) * per_frame,
+      double(uploads[VulkanCommandProcessor::kUploadAfterSignal]) * per_frame,
+      double(uploads[VulkanCommandProcessor::kUploadAfterGpuWrite]) * per_frame,
+      ThermalStateNote());
 }
 
 uint32_t Fh1NativeExecutor::GpuBegin() {

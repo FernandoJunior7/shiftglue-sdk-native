@@ -381,6 +381,7 @@ class CommandProcessor {
   // sees wait for the recorder first. Backends opt in.
   virtual bool SupportsRecordThread() const { return false; }
   bool record_split() const { return record_split_; }
+  uint64_t gpu_signal_count() const { return gpu_signal_count_; }
   // The register file the decoder reads: the shadow while split.
   RegisterFile& decode_regs() { return record_split_ ? *decode_register_file_ : *register_file_; }
   // Register writes from packets: applied directly, or recorded while split.
@@ -478,6 +479,7 @@ class CommandProcessor {
   std::vector<uint32_t> me_bin_;
 
   uint32_t counter_ = 0;
+  uint64_t gpu_signal_count_ = 0;
 
   uint32_t primary_buffer_ptr_ = 0;
   uint32_t primary_buffer_size_ = 0;

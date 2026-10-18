@@ -10,6 +10,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -33,6 +34,12 @@ class DeferredCommandBuffer {
   // Exchanges the recorded commands (the submission worker takes a finished
   // stream and leaves an empty one to record into).
   void Swap(DeferredCommandBuffer& other) { command_stream_.swap(other.command_stream_); }
+
+  size_t GetPosition() const { return command_stream_.size(); }
+  void MoveCommandsTo(size_t start, size_t position) {
+    std::rotate(command_stream_.begin() + position, command_stream_.begin() + start,
+                command_stream_.end());
+  }
 
   // render_pass_begin->pNext of all barriers must be null.
   void CmdVkBeginRenderPass(const VkRenderPassBeginInfo* render_pass_begin,

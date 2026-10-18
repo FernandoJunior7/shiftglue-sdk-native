@@ -224,6 +224,21 @@ class VulkanCommandProcessor : public CommandProcessor {
   // Dynamic rendering for the FH1 native executor: begins the scope unless
   // the one identified by `id` is already open. Submission must be open.
   void SubmitBarriersAndBeginFh1Rendering(const VkRenderingInfo& rendering_info, uint64_t id);
+  bool CanHoistSharedMemoryUpload() const;
+  void HoistSharedMemoryUpload(VkBuffer source, VkBuffer destination, uint32_t region_count,
+                               const VkBufferCopy* regions);
+  enum SharedMemoryUploadKind : uint32_t {
+    kUploadHoisted,
+    kUploadOutsideRendering,
+    kUploadHoistingOff,
+    kUploadAfterSignal,
+    kUploadAfterGpuWrite,
+    kUploadKindCount,
+  };
+  void CountSharedMemoryUpload(bool hoisted);
+  std::array<uint64_t, kUploadKindCount> TakeSharedMemoryUploads() {
+    return std::exchange(shared_memory_uploads_, {});
+  }
   // Pipeline barrier commands and FH1 renderings recorded since the last call.
   Fh1NativeExecutor* GetFh1NativeExecutor() const { return fh1_native_executor_.get(); }
   uint64_t TakeBarrierBatchCount() { return std::exchange(barrier_batch_count_, 0); }
@@ -1402,6 +1417,13 @@ class VulkanCommandProcessor : public CommandProcessor {
   VkRenderPass current_render_pass_;
   const VulkanRenderTargetCache::Framebuffer* current_framebuffer_;
   bool in_render_pass_ = false;
+
+  void FlushHoistedUploads();
+  size_t hoist_position_ = SIZE_MAX;
+  uint64_t hoist_signal_count_ = 0;
+  VkBuffer hoist_destination_ = VK_NULL_HANDLE;
+  std::vector<std::pair<VkBuffer, VkBufferCopy>> hoisted_copies_;
+  std::array<uint64_t, kUploadKindCount> shared_memory_uploads_ = {};
 
   // Currently bound graphics pipeline, either from the pipeline cache (with
   // potentially deferred creation - current_external_graphics_pipeline_ is

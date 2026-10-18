@@ -169,6 +169,12 @@ REXCVAR_DEFINE_BOOL(vulkan_debug_labels, false, "GPU/Vulkan",
                     "Label GPU work for capture tools (VK_EXT_debug_utils): FH1 draw, transfer "
                     "and clear renderings, resolves, texture loads and uploads")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(vulkan_hoist_shared_memory_uploads, false, "GPU/Vulkan",
+                    "Copy shared memory uploads made during an FH1 rendering before that "
+                    "rendering instead of ending it, unless a fence or interrupt was signaled "
+                    "since it began (a tiler stores and reloads the attachments at every "
+                    "rendering boundary)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_INT32(vulkan_async_submission_split_draws, 1024, "GPU/Vulkan",
                      "With vulkan_async_submission, end a submission after this many draws "
                      "when no occlusion query is open, so frames overlap with the worker; 0 "
@@ -4340,6 +4346,7 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
   }
 
   if (in_render_pass_) {
+    FlushHoistedUploads();
     if (use_dynamic_rendering) {
       deferred_command_buffer_.CmdVkEndRendering();
     } else {
@@ -4414,6 +4421,7 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
   }
 
   if (in_render_pass_) {
+    FlushHoistedUploads();
     if (use_dynamic_rendering) {
       deferred_command_buffer_.CmdVkEndRendering();
     } else {
@@ -4498,6 +4506,8 @@ void VulkanCommandProcessor::SubmitBarriersAndBeginFh1Rendering(
     return;
   }
   EndRenderPass();
+  hoist_position_ = deferred_command_buffer_.GetPosition();
+  hoist_signal_count_ = gpu_signal_count();
   deferred_command_buffer_.CmdVkBeginRendering(&rendering_info);
   const char* const next_rendering_label = next_rendering_label_;
   next_rendering_label_ = nullptr;
@@ -4591,9 +4601,63 @@ void VulkanCommandProcessor::FlushCpuVisibleResults() {
   }
 }
 
+bool VulkanCommandProcessor::CanHoistSharedMemoryUpload() const {
+  return in_render_pass_ && hoist_position_ != SIZE_MAX &&
+         hoist_signal_count_ == gpu_signal_count() &&
+         REXCVAR_GET(vulkan_hoist_shared_memory_uploads);
+}
+
+void VulkanCommandProcessor::HoistSharedMemoryUpload(VkBuffer source, VkBuffer destination,
+                                                     uint32_t region_count,
+                                                     const VkBufferCopy* regions) {
+  hoist_destination_ = destination;
+  for (uint32_t i = 0; i < region_count; ++i) {
+    hoisted_copies_.emplace_back(source, regions[i]);
+  }
+}
+
+void VulkanCommandProcessor::CountSharedMemoryUpload(bool hoisted) {
+  ++shared_memory_uploads_[hoisted                                         ? kUploadHoisted
+                           : !in_render_pass_ || hoist_position_ == SIZE_MAX ? kUploadOutsideRendering
+                           : !REXCVAR_GET(vulkan_hoist_shared_memory_uploads) ? kUploadHoistingOff
+                           : hoist_signal_count_ != gpu_signal_count()        ? kUploadAfterSignal
+                                                                              : kUploadAfterGpuWrite];
+}
+
+void VulkanCommandProcessor::FlushHoistedUploads() {
+  const size_t position = std::exchange(hoist_position_, SIZE_MAX);
+  if (hoisted_copies_.empty()) {
+    return;
+  }
+  const size_t start = deferred_command_buffer_.GetPosition();
+  VkMemoryBarrier barrier = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
+                             VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT};
+  deferred_command_buffer_.CmdVkPipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                                VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &barrier, 0,
+                                                nullptr, 0, nullptr);
+  std::vector<VkBufferCopy> regions;
+  for (size_t i = 0; i < hoisted_copies_.size(); ++i) {
+    regions.push_back(hoisted_copies_[i].second);
+    if (i + 1 == hoisted_copies_.size() ||
+        hoisted_copies_[i + 1].first != hoisted_copies_[i].first) {
+      deferred_command_buffer_.CmdVkCopyBuffer(hoisted_copies_[i].first, hoist_destination_,
+                                               uint32_t(regions.size()), regions.data());
+      regions.clear();
+    }
+  }
+  barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+  barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+  deferred_command_buffer_.CmdVkPipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &barrier,
+                                                0, nullptr, 0, nullptr);
+  deferred_command_buffer_.MoveCommandsTo(start, position);
+  hoisted_copies_.clear();
+}
+
 void VulkanCommandProcessor::EndRenderPass(std::source_location caller) {
   assert_true(submission_open_);
   current_fh1_rendering_id_ = 0;
+  FlushHoistedUploads();
   if (!in_render_pass_) {
     return;
   }
@@ -7060,6 +7124,8 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
     current_render_pass_ = VK_NULL_HANDLE;
     current_framebuffer_ = nullptr;
     in_render_pass_ = false;
+    hoist_position_ = SIZE_MAX;
+    hoisted_copies_.clear();
     current_guest_graphics_pipeline_ = VK_NULL_HANDLE;
     current_external_graphics_pipeline_ = VK_NULL_HANDLE;
     current_external_compute_pipeline_ = VK_NULL_HANDLE;

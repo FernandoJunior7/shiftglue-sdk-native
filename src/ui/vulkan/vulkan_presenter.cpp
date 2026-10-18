@@ -853,6 +853,12 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
   // GPU.
   if (paint_context_.vulkan_surface != VK_NULL_HANDLE) {
     VkSwapchainKHR old_swapchain = paint_context_.PrepareForSwapchainRetirement();
+#if REX_PLATFORM_MAC
+    if (old_swapchain != VK_NULL_HANDLE) {
+      dfn.vkDestroySwapchainKHR(device, old_swapchain, nullptr);
+      old_swapchain = VK_NULL_HANDLE;
+    }
+#endif
     bool surface_unusable;
     paint_context_.swapchain_last_present_id = 0;
     paint_context_.swapchain = PaintContext::CreateSwapchainForVulkanSurface(

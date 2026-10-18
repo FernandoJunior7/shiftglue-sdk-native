@@ -2001,6 +2001,7 @@ bool CommandProcessor::ExecutePacketType3_INTERRUPT(memory::RingBuffer* reader, 
   // generate interrupt from the command stream
   uint32_t cpu_mask = reader->ReadAndSwap<uint32_t>();
   RecordCall([this, cpu_mask]() {
+    ++gpu_signal_count_;
     if (record_split_) {
       FlushCpuVisibleResults();
     }
@@ -2407,10 +2408,12 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_SHD(memory::RingBuffer* re
   address &= ~0x3;
   data_value = GpuSwap(data_value, endianness);
   if (!record_split_) {
+    ++gpu_signal_count_;
     memory::store(memory_->TranslatePhysical(address), data_value);
     return true;
   }
   RecordCall([this, address, data_value]() {
+    ++gpu_signal_count_;
     FlushCpuVisibleResults();
     memory::store(memory_->TranslatePhysical(address), data_value);
     system::SignalGpuWrite();
