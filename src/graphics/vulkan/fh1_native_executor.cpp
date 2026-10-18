@@ -115,6 +115,29 @@ REXCVAR_DEFINE_BOOL(fh1_fold_clears, true, "GPU",
                     "its load op) instead of in a rendering of their own: on tiled GPUs each "
                     "rendering costs a pass over the tiles (FH1 native executor, Vulkan)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(fh1_defer_band_clears, false, "GPU",
+                    "Keep a surface's pending clears past resolves reading none of their "
+                    "pixels, and begin with a clear load op where pending clears of one value "
+                    "together cover the whole surface, instead of loading it to draw them "
+                    "(FH1 native executor, Vulkan)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(fh1_draw_in_transfer_rendering, false, "GPU",
+                    "Draws into only the surface that a transfer or clear rendering just "
+                    "wrote continue that rendering instead of beginning their own: each "
+                    "rendering costs a fixed pass over the tiles on tiled GPUs (FH1 native "
+                    "executor, Vulkan)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(fh1_transfer_cleared_as_clear, false, "GPU",
+                    "Transfers of EDRAM tiles that only pending zero clears wrote become zero "
+                    "clears of the destination, instead of a rendering applying the clears "
+                    "and another copying them (FH1 native executor, Vulkan)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(fh1_untiled_skip_transfers_in, false, "GPU",
+                    "With fh1_untile_predicated_tiling, give the surfaces of untiled tiling "
+                    "the EDRAM tiles that other surfaces wrote without copying their contents: "
+                    "on the console the first tile also starts with whatever other passes "
+                    "left there, so the game overwrites it (FH1 native executor, Vulkan)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_INT32(fh1_debug_rendering_split_draws, 0, "GPU",
                      "Diagnostics: end the draw rendering every N draws (0: never), to measure "
                      "the cost of a rendering on the GPU. Same image, more renderings")
@@ -132,7 +155,7 @@ REXCVAR_DEFINE_BOOL(fh1_debug_skip_stencil_transfers, false, "GPU",
 REXCVAR_DEFINE_STRING(fh1_debug_skip_transfers, "", "GPU",
                       "Diagnostics: skip transfers between these surfaces, as "
                       "<source>=<destination> descriptions (wrong image if they are needed)")
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DECLARE(bool, fh1_texture_reload_probe);
 REXCVAR_DEFINE_BOOL(fh1_resolve_two_textures, true, "GPU",
                     "Resolves write up to two textures over their destination directly (such as "
@@ -146,7 +169,7 @@ REXCVAR_DEFINE_STRING(fh1_coarse_shading, "", "GPU",
 REXCVAR_DEFINE_BOOL(fh1_debug_skip_clears, false, "GPU",
                     "Diagnostics: skip every EDRAM clear (wrong image), to bound what clears "
                     "cost")
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(fh1_debug_skip_resolve_dispatches, false, "GPU",
                     "Diagnostics: keep every resolve's barriers but not its compute dispatch "
                     "(wrong image), to bound what the resolve shaders cost (Vulkan)")
@@ -753,16 +776,22 @@ void Fh1NativeExecutor::TransitionForAttachment(Surface& surface, uint64_t open_
   }
 }
 
-void Fh1NativeExecutor::BeginSurfaceRendering(Surface& surface, bool uint_view) {
+bool Fh1NativeExecutor::BeginSurfaceRendering(Surface& surface, bool uint_view,
+                                              const VkClearValue* load_clear) {
   // Transfers and clears into the surface come after its pending clears.
   FlushPendingClears(surface);
+  // Transfer and clear scopes are keyed apart from draw scopes.
+  const uint64_t id =
+      (uint64_t(1) << 63) | (uint64_t(surface.key.Pack()) << 1) | uint64_t(uint_view);
+  if (load_clear && command_processor_.IsFh1RenderingOpen(id)) load_clear = nullptr;
   VkRenderingAttachmentInfo attachment = {};
   attachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
   attachment.imageView = uint_view && surface.uint_view ? surface.uint_view : surface.view;
   attachment.imageLayout = surface.layout;
   attachment.resolveMode = VK_RESOLVE_MODE_NONE;
-  attachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+  attachment.loadOp = load_clear ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
   attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+  if (load_clear) attachment.clearValue = *load_clear;
   VkRenderingInfo info = {};
   info.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
   info.renderArea.extent = {surface.width * scale_, surface.image_height * scale_};
@@ -776,12 +805,10 @@ void Fh1NativeExecutor::BeginSurfaceRendering(Surface& surface, bool uint_view) 
   }
   command_processor_.SetNextRenderingLabel(
       surface.key.is_depth ? "fh1 depth transfer or clear" : "fh1 color transfer or clear");
-  // Transfer and clear scopes are keyed apart from draw scopes.
-  const uint64_t id =
-      (uint64_t(1) << 63) | (uint64_t(surface.key.Pack()) << 1) | uint64_t(uint_view);
   rendering_id_ = 0;
   command_processor_.SubmitBarriersAndBeginFh1Rendering(info, id);
   draw_rendering_surfaces_.clear();
+  return load_clear != nullptr;
 }
 
 void Fh1NativeExecutor::EndUntiledTiling() {
@@ -1300,23 +1327,24 @@ VkDescriptorSet Fh1NativeExecutor::AllocateDescriptorSet(VkDescriptorSetLayout l
   }
 }
 
-void Fh1NativeExecutor::TransferTiles(Surface& dest, const TileRun& run) {
-  const uint32_t msaa_x_log2 = uint32_t(dest.key.msaa >= uint32_t(xenos::MsaaSamples::k4X));
-  const uint32_t msaa_y_log2 = uint32_t(dest.key.msaa >= uint32_t(xenos::MsaaSamples::k2X));
-  const uint32_t dest_64bpp = dest.key.Is64bpp() ? 1 : 0;
-  const uint32_t tile_width = (xenos::kEdramTileWidthSamples >> msaa_x_log2) >> dest_64bpp;
+uint32_t Fh1NativeExecutor::TileRunRects(const Surface& surface, uint32_t run_first,
+                                         uint32_t run_count, Rect* rects) const {
+  const SurfaceKey& key = surface.key;
+  const uint32_t msaa_x_log2 = uint32_t(key.msaa >= uint32_t(xenos::MsaaSamples::k4X));
+  const uint32_t msaa_y_log2 = uint32_t(key.msaa >= uint32_t(xenos::MsaaSamples::k2X));
+  const uint32_t is_64bpp = key.Is64bpp() ? 1 : 0;
+  const uint32_t tile_width = (xenos::kEdramTileWidthSamples >> msaa_x_log2) >> is_64bpp;
   const uint32_t tile_height = xenos::kEdramTileHeightSamples >> msaa_y_log2;
-  const uint32_t pitch = dest.key.pitch_tiles << dest_64bpp;
-  const uint32_t first = (run.first - dest.key.base_tiles) & (xenos::kEdramTileCount - 1);
-  const uint32_t end = first + run.count;
-  Rect rects[3];
+  const uint32_t pitch = key.pitch_tiles << is_64bpp;
+  const uint32_t first = (run_first - key.base_tiles) & (xenos::kEdramTileCount - 1);
+  const uint32_t end = first + run_count;
   uint32_t rect_count = 0;
   auto add_rect = [&](uint32_t column_first, uint32_t row_first, uint32_t column_end,
                       uint32_t row_end) {
     Rect rect = {int32_t(column_first * tile_width), int32_t(row_first * tile_height),
-                 int32_t(std::min(column_end * tile_width, dest.width)),
-                 int32_t(std::min(row_end * tile_height, dest.height))};
-    if (rect.left < rect.right && rect.top < rect.bottom) rects[rect_count++] = HostRect(rect);
+                 int32_t(std::min(column_end * tile_width, surface.width)),
+                 int32_t(std::min(row_end * tile_height, surface.height))};
+    if (rect.left < rect.right && rect.top < rect.bottom) rects[rect_count++] = rect;
   };
   const uint32_t first_row = first / pitch, last_row = (end - 1) / pitch;
   if (first_row == last_row) {
@@ -1334,10 +1362,46 @@ void Fh1NativeExecutor::TransferTiles(Surface& dest, const TileRun& run) {
     }
     if (full_first < full_end) add_rect(0, full_first, pitch, full_end);
   }
-  if (rect_count) {
-    TransferRects(dest, run.previous_owner, rects, rect_count, run.count,
-                  tiles_.AnyStencil(run.first, run.count));
+  return rect_count;
+}
+
+bool Fh1NativeExecutor::TilesZeroCleared(const Surface& surface, const TileRun& run) const {
+  if (surface.pending_clears.empty()) return false;
+  static const VkClearValue kZero = {};
+  for (const Surface::PendingClear& clear : surface.pending_clears) {
+    if (std::memcmp(&clear.clear.clearValue, &kZero, sizeof(kZero))) return false;
   }
+  Rect rects[3];
+  const uint32_t rect_count = TileRunRects(surface, run.first, run.count, rects);
+  for (uint32_t i = 0; i < rect_count; ++i) {
+    const Rect host = HostRect(rects[i]);
+    bool covered = false;
+    for (const Surface::PendingClear& clear : surface.pending_clears) {
+      const VkRect2D& r = clear.rect.rect;
+      covered |= r.offset.x <= host.left && r.offset.y <= host.top &&
+                 r.offset.x + int32_t(r.extent.width) >= host.right &&
+                 r.offset.y + int32_t(r.extent.height) >= host.bottom;
+    }
+    if (!covered) return false;
+  }
+  return true;
+}
+
+void Fh1NativeExecutor::TransferTiles(Surface& dest, const TileRun& run) {
+  Rect rects[3];
+  const uint32_t rect_count = TileRunRects(dest, run.first, run.count, rects);
+  if (!rect_count) return;
+  if (REXCVAR_GET(fh1_transfer_cleared_as_clear)) {
+    const Surface* source = FindSurface(run.previous_owner);
+    if (source && source != &dest && TilesZeroCleared(*source, run)) {
+      for (uint32_t i = 0; i < rect_count; ++i) ClearSurfaceRect(dest, rects[i], 0, 0);
+      Count("transfer_as_clear");
+      return;
+    }
+  }
+  for (uint32_t i = 0; i < rect_count; ++i) rects[i] = HostRect(rects[i]);
+  TransferRects(dest, run.previous_owner, rects, rect_count, run.count,
+                tiles_.AnyStencil(run.first, run.count));
 }
 
 void Fh1NativeExecutor::ClaimTileRect(const SurfaceKey& key, uint32_t column_first,
@@ -1390,12 +1454,16 @@ void Fh1NativeExecutor::TransferRects(Surface& dest, uint32_t previous_owner, co
     return Skip("transfer_format");
   }
   {
-    static const std::string skip_pairs = REXCVAR_GET(fh1_debug_skip_transfers);
+    const std::string& skip_pairs = REXCVAR_GET(fh1_debug_skip_transfers);
     if (!skip_pairs.empty() &&
         skip_pairs.find(source->key.Describe() + "=" + dest.key.Describe()) != std::string::npos) {
       Count("debug_transfer_skipped");
       return;
     }
+  }
+  if (dest.untiled && REXCVAR_GET(fh1_untiled_skip_transfers_in)) {
+    Count("transfer_into_untiled_skipped");
+    return;
   }
   Count("transfer");
   ++transfer_count_;
@@ -2131,6 +2199,19 @@ bool Fh1NativeExecutor::BindTargets(VulkanRenderTargetCache::RenderPassKey& key_
     }
   }
   const uint64_t rendering_id = DrawRenderingId(used_bits);
+  if ((used_bits == 1 || used_bits == 2) && REXCVAR_GET(fh1_draw_in_transfer_rendering)) {
+    const uint32_t i = used_bits == 1 ? 0 : 1;
+    const uint64_t surface_id =
+        (uint64_t(1) << 63) | (uint64_t(keys[i].Pack()) << 1);
+    if (command_processor_.IsFh1RenderingOpen(surface_id)) {
+      command_processor_.RenameFh1Rendering(surface_id, rendering_id);
+      open_draw_rendering_id_ = rendering_id;
+      open_draw_bits_ = used_bits;
+      std::copy(std::begin(pending_keys_), std::end(pending_keys_), std::begin(open_draw_keys_));
+      draw_rendering_surfaces_ = keys[i].Describe();
+      Count("draw_continued_surface_rendering");
+    }
+  }
   key_out.msaa_samples = single_sample_msaa_
                              ? xenos::MsaaSamples::k1X
                              : register_file_.Get<reg::RB_SURFACE_INFO>().msaa_samples;
@@ -2426,14 +2507,44 @@ void Fh1NativeExecutor::FlushPendingClears(Surface& surface) {
   GpuTimer gpu_timer(*this, kGpuClears);
   command_processor_.Checkpoint(VulkanCommandProcessor::CheckpointKind::kClear);
   TransitionForAttachment(surface);
-  BeginSurfaceRendering(surface, false);
-  for (const Surface::PendingClear& pending : clears) {
-    command_processor_.deferred_command_buffer().CmdVkClearAttachments(1, &pending.clear, 1,
-                                                                       &pending.rect);
+  const VkClearValue* covering =
+      REXCVAR_GET(fh1_defer_band_clears)
+          ? CoveringClear(clears, surface.width * scale_, surface.image_height * scale_)
+          : nullptr;
+  if (BeginSurfaceRendering(surface, false, covering)) {
+    Count("clear_load_op");
+  } else {
+    for (const Surface::PendingClear& pending : clears) {
+      command_processor_.deferred_command_buffer().CmdVkClearAttachments(1, &pending.clear, 1,
+                                                                         &pending.rect);
+    }
   }
   // Whatever renders into the surface next is ordered after the clears.
   TransitionForAttachment(surface);
   Count("clear_flushed");
+}
+
+const VkClearValue* Fh1NativeExecutor::CoveringClear(
+    const std::vector<Surface::PendingClear>& clears, uint32_t width, uint32_t height) const {
+  if (clears.empty()) return nullptr;
+  const VkClearAttachment& last = clears.back().clear;
+  std::vector<std::pair<uint32_t, uint32_t>> rows;
+  for (const Surface::PendingClear& clear : clears) {
+    const VkRect2D& r = clear.rect.rect;
+    if (clear.clear.aspectMask != last.aspectMask ||
+        std::memcmp(&clear.clear.clearValue, &last.clearValue, sizeof(VkClearValue)) ||
+        r.offset.x != 0 || r.extent.width != width || r.offset.y < 0) {
+      return nullptr;
+    }
+    rows.emplace_back(uint32_t(r.offset.y), uint32_t(r.offset.y) + r.extent.height);
+  }
+  std::sort(rows.begin(), rows.end());
+  uint32_t covered = 0;
+  for (const auto& [top, bottom] : rows) {
+    if (top > covered) return nullptr;
+    covered = std::max(covered, bottom);
+  }
+  return covered >= height ? &last.clearValue : nullptr;
 }
 
 void Fh1NativeExecutor::FoldPendingClears(Surface* const* bound, uint32_t width, uint32_t height,
@@ -2459,8 +2570,11 @@ void Fh1NativeExecutor::FoldPendingClears(Surface* const* bound, uint32_t width,
       }
       VkRenderingAttachmentInfo* attachment = i ? (colors ? &colors[i - 1] : nullptr) : depth;
       const VkRect2D& last = pending.back().rect.rect;
-      if (attachment && !last.offset.x && !last.offset.y && last.extent.width == width &&
-          last.extent.height == height) {
+      const VkClearValue* covering =
+          REXCVAR_GET(fh1_defer_band_clears) ? CoveringClear(pending, width, height) : nullptr;
+      if (attachment && (covering || (!last.offset.x && !last.offset.y &&
+                                      last.extent.width == width &&
+                                      last.extent.height == height))) {
         // The last clear covers the whole rendering: it replaces the load.
         attachment->loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
         attachment->clearValue = pending.back().clear.clearValue;
@@ -2536,8 +2650,6 @@ bool Fh1NativeExecutor::ResolveToMemory(const SourceRect& source, const SurfaceK
     return false;
   }
   const ui::vulkan::VulkanDevice* vulkan_device = command_processor_.GetVulkanDevice();
-  TransitionForSampling(surface, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
-  command_processor_.SubmitBarriers(true);
   VkDescriptorImageInfo images[2] = {
       {VK_NULL_HANDLE, surface.sampled_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
       {VK_NULL_HANDLE, surface.stencil_view ? surface.stencil_view : surface.sampled_view,
@@ -2621,6 +2733,14 @@ bool Fh1NativeExecutor::ResolveToMemory(const SourceRect& source, const SurfaceK
                       (select == uint32_t(xenos::CopySampleSelect::k23) ? 2u : 0u);
     }
   }
+  {
+    auto& volume = resolve_volume_[fmt::format(
+        "{}{}>{}{}{}", owner.Describe(), host_sample_mode == 3 ? "s" : "",
+        resolve_key.msaa == owner.msaa ? "" : resolve_key.Describe() + "/",
+        sample_select & 0xFFFFu, image_view == VK_NULL_HANDLE ? "" : image2_view ? "tt" : "t")];
+    ++volume.first;
+    volume.second += uint64_t(rect.right - rect.left) * uint64_t(rect.bottom - rect.top);
+  }
   constants[4] = sample_select;
   constants[5] = dest_info | ((scale_ - 1) << 20) | (unscaled_dest ? 1u << 22 : 0u);
   constants[6] = dest_base;
@@ -2628,6 +2748,28 @@ bool Fh1NativeExecutor::ResolveToMemory(const SourceRect& source, const SurfaceK
   constants[8] = image_row * scale_;
   constants[9] = image_endian;
   constants[10] = image2_view != VK_NULL_HANDLE ? image2_endian | (1u << 5) : 0u;
+  std::vector<Surface::PendingClear> later_clears;
+  if (REXCVAR_GET(fh1_defer_band_clears) && ((constants[3] >> 30) & 1) &&
+      !surface.pending_clears.empty()) {
+    const int32_t band = int32_t(sample_select >> 16);
+    const int32_t left = source.rect.left * int32_t(scale_);
+    const int32_t right = source.rect.right * int32_t(scale_);
+    const int32_t top = (source.rect.top + band) * int32_t(scale_);
+    const int32_t bottom = (source.rect.bottom + band) * int32_t(scale_);
+    bool disjoint = true;
+    for (const Surface::PendingClear& clear : surface.pending_clears) {
+      const VkRect2D& r = clear.rect.rect;
+      disjoint &= r.offset.x >= right || r.offset.x + int32_t(r.extent.width) <= left ||
+                  r.offset.y >= bottom || r.offset.y + int32_t(r.extent.height) <= top;
+    }
+    if (disjoint) {
+      later_clears.swap(surface.pending_clears);
+      Count("clear_kept_past_resolve");
+    }
+  }
+  TransitionForSampling(surface, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+  command_processor_.SubmitBarriers(true);
+  if (!later_clears.empty()) surface.pending_clears.swap(later_clears);
   if (const VkPipeline specialized = GetSpecializedResolvePipeline(
           image_view != VK_NULL_HANDLE, kind, msaa, constants)) {
     pipeline = specialized;
@@ -2999,6 +3141,7 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
       if (untile_band) {
         uint32_t& band = untile_bands_[source.surface->key.Pack()];
         band = std::max(band, untile_band);
+        source.surface->untiled = true;
       }
       if (!ResolveToMemory(
               source, plan.resolve_key, plan.sample_select | (untile_band << 16), plan.dest_info,
@@ -3135,6 +3278,7 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
       clear_rect.bottom += int32_t(untile_band);
       uint32_t& band = untile_bands_[key.Pack()];
       band = std::max(band, untile_band);
+      surface->untiled = true;
     }
     ClearSurfaceRect(*surface, clear_rect, value, value_lo);
     Count(key.is_depth ? "clear_depth" : "clear_color");
@@ -3358,6 +3502,23 @@ void Fh1NativeExecutor::LogStats(uint64_t frame) {
     stats_frame_ = frame;
     REXGPU_INFO("FH1 native executor (Vulkan) transfer tile-passes per frame: {}", top);
     transfer_volume_.clear();
+  }
+  if (!resolve_volume_.empty()) {
+    std::vector<std::pair<uint64_t, std::string>> volume;
+    const double frames = double(std::max<uint64_t>(frame - resolve_stats_frame_, 1));
+    for (const auto& [key, value] : resolve_volume_) {
+      volume.emplace_back(value.second, fmt::format("{}={:.1f}x{:.2f}M", key,
+                                                    double(value.first) / frames,
+                                                    double(value.second) / frames / 1e6));
+    }
+    std::sort(volume.begin(), volume.end(), std::greater<>());
+    std::string top;
+    for (size_t i = 0; i < volume.size() && i < 16; ++i) {
+      top += fmt::format("{}{}", i ? " " : "", volume[i].second);
+    }
+    resolve_stats_frame_ = frame;
+    REXGPU_INFO("FH1 native executor (Vulkan) resolves per frame (count x host pixels): {}", top);
+    resolve_volume_.clear();
   }
   const uint64_t window_frames = frame >= 600 ? 600 : std::max<uint64_t>(frame, 1);
   const auto causes = command_processor_.TakeFh1RenderingCauses();

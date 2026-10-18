@@ -107,7 +107,7 @@ REXCVAR_DEFINE_BOOL(fh1_debug_tiny_draws, false, "GPU",
 REXCVAR_DEFINE_BOOL(fh1_debug_skip_draw_calls, false, "GPU",
                     "Diagnostics: record every draw's state but not its draw command (wrong "
                     "image), to bound what the GPU spends per draw (Vulkan)")
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(fh1_native_gpu_profile_draws, false, "GPU",
                     "Diagnostics: with fh1_native_gpu_profile, also time every draw by its "
                     "pixel shader (Vulkan)")
@@ -199,7 +199,8 @@ REXCVAR_DEFINE_BOOL(vulkan_split_submissions_between_renderings, false, "GPU/Vul
                     "draw while no rendering is open instead of after the draw that reached "
                     "the count, which ended the open rendering (and stored and reloaded its "
                     "attachments on a tiler); a rendering longer than 4 times the count is "
-                    "still split")
+                    "still split. Ends of the guest's primary buffer then submit only "
+                    "between renderings too")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(vulkan_fh1_native_executor, true, "GPU/Vulkan",
                     "Render FH1 with the native executor (EDRAM ownership, transfers "
@@ -5070,7 +5071,8 @@ void VulkanCommandProcessor::SetScissor(const VkRect2D& scissor) {
 
 void VulkanCommandProcessor::OnPrimaryBufferEnd() {
   if (REXCVAR_GET(vulkan_submit_on_primary_buffer_end) && submission_open_ &&
-      CanEndSubmissionImmediately()) {
+      CanEndSubmissionImmediately() &&
+      !(in_render_pass_ && REXCVAR_GET(vulkan_split_submissions_between_renderings))) {
     EndSubmission(false);
   }
 }

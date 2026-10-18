@@ -176,6 +176,7 @@ class Fh1NativeExecutor {
     VkAccessFlags access = 0;
     SurfaceKey key;
     bool stencil_nonzero = false;
+    bool untiled = false;
     uint32_t samples = 1;
     uint32_t width = 0;
     // The EDRAM addressing period's height; the image may be taller
@@ -279,6 +280,9 @@ class Fh1NativeExecutor {
   void ClaimTileRect(const SurfaceKey& key, uint32_t column_first, uint32_t row_first,
                      uint32_t column_end, uint32_t row_end);
   void TransferTiles(Surface& dest, const TileRun& run);
+  uint32_t TileRunRects(const Surface& surface, uint32_t run_first, uint32_t run_count,
+                        Rect* rects) const;
+  bool TilesZeroCleared(const Surface& surface, const TileRun& run) const;
   void TransferRects(Surface& dest, uint32_t previous_owner, const Rect* rects,
                      uint32_t rect_count, uint32_t tile_count, bool tiles_stencil);
   void FlushTransfers();
@@ -323,7 +327,10 @@ class Fh1NativeExecutor {
   void QueueResolveReadback(uint32_t address, uint32_t length);
 
   // Dynamic rendering into one surface for transfers and clears.
-  void BeginSurfaceRendering(Surface& surface, bool uint_view);
+  bool BeginSurfaceRendering(Surface& surface, bool uint_view,
+                             const VkClearValue* load_clear = nullptr);
+  const VkClearValue* CoveringClear(const std::vector<Surface::PendingClear>& clears,
+                                    uint32_t width, uint32_t height) const;
 
   VkDescriptorSet AllocateDescriptorSet(VkDescriptorSetLayout layout);
   VkPipeline GetTransferPipeline(const TransferPipelineKey& key);
@@ -460,6 +467,7 @@ class Fh1NativeExecutor {
   uint64_t open_draw_rendering_id_ = 0;
   uint32_t open_draw_bits_ = 0;
   uint64_t stats_frame_ = 0;
+  uint64_t resolve_stats_frame_ = 0;
   uint64_t ab_windows_ = 0;
   SurfaceKey open_draw_keys_[1 + xenos::kMaxColorRenderTargets];
   // fh1_coarse_shading, parsed at swaps, and the rate of each draw rendering.
@@ -580,6 +588,7 @@ class Fh1NativeExecutor {
   uint64_t resolves_ = 0;
   // Tile passes per source -> destination surface pair while profiling.
   std::map<std::string, uint64_t> transfer_volume_;
+  std::map<std::string, std::pair<uint64_t, uint64_t>> resolve_volume_;
 };
 
 }  // namespace rex::graphics::vulkan

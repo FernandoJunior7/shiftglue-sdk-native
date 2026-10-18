@@ -308,6 +308,9 @@ class VulkanCommandProcessor : public CommandProcessor {
   bool IsFh1RenderingOpen(uint64_t id) const {
     return in_render_pass_ && id && current_fh1_rendering_id_ == id;
   }
+  void RenameFh1Rendering(uint64_t from, uint64_t to) {
+    if (IsFh1RenderingOpen(from)) current_fh1_rendering_id_ = to;
+  }
   system::GraphicsShaderTranslationObserver GetShaderTranslationObserver() const;
   // Submits the open submission, waits for every queue operation and reopens
   // the submission if one was open (FH1 resolve read-backs).

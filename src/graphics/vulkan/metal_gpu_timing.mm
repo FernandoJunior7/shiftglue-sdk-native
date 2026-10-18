@@ -72,6 +72,7 @@ std::string RenderPassKey(MTLRenderPassDescriptor* descriptor) {
     if (key.empty()) {
       key = fmt::format("{}x{}", a.texture.width, a.texture.height);
     }
+    key += fmt::format(" u{:x}s{}", uint32_t(a.texture.usage), uint32_t(a.texture.sampleCount));
     key += fmt::format(" {}{}:{}{}", name, uint32_t(a.texture.pixelFormat),
                        "DLC"[std::min<uint32_t>(uint32_t(a.loadAction), 2)],
                        "DSRRU?"[std::min<uint32_t>(uint32_t(a.storeAction), 5)]);
